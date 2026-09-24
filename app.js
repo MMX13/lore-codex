@@ -1153,6 +1153,14 @@ const MENTION_RE = /(?:^|\s)@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
 
 function updateSuggestions() {
   if (!editing) return;
+  const selected = selectionInBody();
+  if (selected) {
+    // Keep an open picker while the same text stays selected.
+    if (selPicker && selPicker.text === selected.text) return;
+    closeSuggest();
+    showSelectionChip(selected);
+    return;
+  }
   const ctx = textBeforeCaret();
   if (!ctx) { closeSuggest(); showChip(null); return; }
   const m = ctx.text.match(MENTION_RE);
@@ -1167,30 +1175,7 @@ function updateSuggestions() {
 
 function openMentionMenu(ctx, query, atIndex) {
   const q = query.trim().toLowerCase();
-  const self = editing.page.id;
-  let matches = [];
-  if (!q) {
-    matches = activePages().filter(p => p.id !== self && p.title)
-      .sort((a, b) => b.updated - a.updated).slice(0, 6)
-      .map(p => ({ p, name: p.title }));
-  } else {
-    for (const p of activePages()) {
-      if (p.id === self) continue;
-      let best = null;
-      for (const name of namesOf(p)) {
-        const n = name.toLowerCase();
-        let s = null;
-        if (n === q) s = 0;
-        else if (n.startsWith(q)) s = 1;
-        else if (n.split(/\s+/).some(w => w.startsWith(q))) s = 2;
-        else if (n.includes(q)) s = 3;
-        if (s != null && (!best || s < best.s || (s === best.s && name === p.title))) best = { s, name };
-      }
-      if (best) matches.push({ p, name: best.name, s: best.s });
-    }
-    matches.sort((a, b) => a.s - b.s || collator.compare(a.name, b.name));
-    matches = matches.slice(0, 6);
-  }
+  const matches = matchPages(q);
 
   suggestEl.textContent = '';
   for (const { p, name } of matches) {
@@ -1233,7 +1218,37 @@ function openMentionMenu(ctx, query, atIndex) {
   positionEditbar();
 }
 
+
+function matchPages(q) {
+  const self = editing.page.id;
+  let matches = [];
+  if (!q) {
+    matches = activePages().filter(p => p.id !== self && p.title)
+      .sort((a, b) => b.updated - a.updated).slice(0, 6)
+      .map(p => ({ p, name: p.title }));
+  } else {
+    for (const p of activePages()) {
+      if (p.id === self) continue;
+      let best = null;
+      for (const name of namesOf(p)) {
+        const n = name.toLowerCase();
+        let s = null;
+        if (n === q) s = 0;
+        else if (n.startsWith(q)) s = 1;
+        else if (n.split(/\s+/).some(w => w.startsWith(q))) s = 2;
+        else if (n.includes(q)) s = 3;
+        if (s != null && (!best || s < best.s || (s === best.s && name === p.title))) best = { s, name };
+      }
+      if (best) matches.push({ p, name: best.name, s: best.s });
+    }
+    matches.sort((a, b) => a.s - b.s || collator.compare(a.name, b.name));
+    matches = matches.slice(0, 6);
+  }
+  return matches;
+}
+
 function closeSuggest() {
+  selPicker = null;
   if (suggestEl.hidden) return;
   suggestEl.hidden = true;
   suggestEl.textContent = '';
@@ -1309,6 +1324,80 @@ function showChip(match) {
       chipSlot.textContent = '';
     }
   }, 'Link to ', h('b', { text: displayTitle(match.p) }), '?'));
+}
+
+/* ---------------------------------------------------------------- linking selected text */
+
+let selPicker = null; // { range, text } while the page picker is open for a selection
+
+function selectionInBody() {
+  if (!editing) return null;
+  const sel = getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) return null;
+  const r = sel.getRangeAt(0);
+  if (!editing.bodyEl.contains(r.commonAncestorContainer)) return null;
+  const text = r.toString();
+  if (!text.trim() || text.includes('\n') || text.length > 80) return null;
+  if (r.cloneContents().querySelector('.link')) return null;
+  return { range: r.cloneRange(), text };
+}
+
+function showSelectionChip(selected) {
+  chipSlot.textContent = '';
+  chipSlot.append(h('button', {
+    class: 'link-chip',
+    onclick: () => openSelectionPicker(selectionInBody() || selected)
+  }, '🔗 Link ', h('b', { text: '“' + selected.text.trim() + '”' })));
+}
+
+function openSelectionPicker(selected) {
+  const core = selected.text.trim();
+  const matches = matchPages(core.toLowerCase());
+  chipSlot.textContent = '';
+  suggestEl.textContent = '';
+  for (const { p, name } of matches) {
+    const tn = typeName(p.typeId);
+    const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
+    suggestEl.append(h('button', { onclick: () => linkSelection(selected.range, p.id) },
+      h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub })));
+  }
+  if (!matches.some(m => m.name.toLowerCase() === core.toLowerCase())) {
+    suggestEl.append(h('button', {
+      class: 'create',
+      onclick: () => {
+        const p = {
+          id: uid(), title: core, aka: [], typeId: null, tags: [], body: [],
+          created: Date.now(), updated: Date.now()
+        };
+        db.pages[p.id] = p;
+        persistSoon();
+        linkSelection(selected.range, p.id);
+        toast(`Created page “${core}”`);
+      }
+    }, h('div', { class: 't', text: `＋ Create page “${core}”` })));
+  }
+  suggestEl.hidden = false;
+  selPicker = selected;
+  positionEditbar();
+}
+
+// Replace the selected text with a link, keeping any spaces around it as plain text.
+function linkSelection(range, pageId) {
+  const text = range.toString();
+  const lead = text.match(/^\s*/)[0];
+  const trail = text.slice(lead.length).match(/\s*$/)[0];
+  const core = text.trim();
+  range.deleteContents();
+  const after = document.createTextNode(trail);
+  const frag = document.createDocumentFragment();
+  if (lead) frag.append(lead);
+  frag.append(linkEl({ l: pageId, t: core }), after);
+  range.insertNode(frag);
+  editing.bodyEl.focus({ preventScroll: true });
+  setCaret(after, trail.length);
+  closeSuggest();
+  chipSlot.textContent = '';
+  bodyChanged();
 }
 
 /* ---------------------------------------------------------------- settings */
