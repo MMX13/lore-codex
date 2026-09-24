@@ -1387,11 +1387,11 @@ function renderSettings() {
   const fileInput = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
   fileInput.addEventListener('change', () => importBackup(fileInput.files[0]));
   const backupPanel = h('div', { class: 'panel leaf' },
-    h('p', { text: 'Your notes live only on this phone. Save a backup file now and then — somewhere safe like Files or your cloud drive.' }),
+    h('p', { text: 'Your notes live only on this phone. Save a backup file now and then — somewhere safe like Files or your cloud drive. Import adds pages from a Lore Codex file, or replaces everything with it.' }),
     h('p', { class: 'sub', text: last ? `Last backup: ${new Date(last).toLocaleDateString()}` : 'No backup made yet.' }),
     h('div', { class: 'row' },
       h('button', { class: 'btn gilt', onclick: exportBackup }, 'Save backup'),
-      h('button', { class: 'btn', onclick: () => fileInput.click() }, 'Restore from file')
+      h('button', { class: 'btn', onclick: () => fileInput.click() }, 'Import from file')
     ),
     fileInput
   );
@@ -1439,14 +1439,44 @@ async function importBackup(file) {
     return;
   }
   const n = Object.keys(incoming.pages).length;
+  const plural = `${n} page${n === 1 ? '' : 's'}`;
   sheet({
-    title: 'Restore this backup?',
-    message: `It holds ${n} page${n === 1 ? '' : 's'}. Everything currently on this phone will be replaced.`,
-    actions: [{
-      label: 'Replace with backup', style: 'danger',
-      run: () => { db = incoming; persistNow(); render(); toast('Backup restored'); }
-    }]
+    title: 'Import this file?',
+    message: `It holds ${plural}. Add them to your codex, or replace everything on this phone with the file.`,
+    actions: [
+      {
+        label: `Add ${plural} to my codex`, style: 'gilt',
+        run: () => { const added = mergeInto(incoming); persistNow(); render(); toast(`Imported ${added} page${added === 1 ? '' : 's'}`); }
+      },
+      {
+        label: 'Replace everything', style: 'danger',
+        run: () => { db = incoming; persistNow(); render(); toast('Backup restored'); }
+      }
+    ]
   });
+}
+
+// Add another codex's pages to this one. Types are matched by name; missing ones are created.
+function mergeInto(incoming) {
+  const typeMap = {};
+  for (const t of incoming.types) {
+    let mine = db.types.find(x => x.name.toLowerCase() === t.name.toLowerCase());
+    if (!mine) { mine = { id: uid(), name: t.name }; db.types.push(mine); }
+    typeMap[t.id] = mine.id;
+  }
+  const idMap = {};
+  for (const id of Object.keys(incoming.pages)) idMap[id] = db.pages[id] ? uid() : id;
+  let added = 0;
+  for (const p of Object.values(incoming.pages)) {
+    const copy = JSON.parse(JSON.stringify(p));
+    copy.id = idMap[p.id];
+    copy.typeId = p.typeId ? typeMap[p.typeId] || null : null;
+    for (const seg of copy.body) if (typeof seg !== 'string' && idMap[seg.l]) seg.l = idMap[seg.l];
+    delete copy.fresh;
+    db.pages[copy.id] = copy;
+    added++;
+  }
+  return added;
 }
 
 /* ---------------------------------------------------------------- archive */

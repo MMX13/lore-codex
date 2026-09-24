@@ -13,7 +13,7 @@ A small, personal wiki for keeping track of names, places and lore while playing
 - **Link pages** by typing `@` and picking a name, or tap the "Link to …?" chip that appears when you type an existing page's name.
 - **Tap an "also known as" name** to make it the main title. Links keep working.
 - **Archive** a page from its ⋯ menu. Links to it turn faded; tap one to restore it or start a new page.
-- **Settings (⚙)**: edit page types, open the archive, and save/restore a backup file. Make backups now and then.
+- **Settings (⚙)**: edit page types, open the archive, and save a backup file, and import pages from a Lore Codex file (add to your codex, or replace everything). Make backups now and then.
 
 ## Hosting
 
