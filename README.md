@@ -12,6 +12,7 @@ A small, personal wiki for keeping track of names, places and lore while playing
 - **Hold anywhere on a page** to start writing at that spot. Tap **Done** when finished (it saves as you type).
 - **Link pages** by typing `@` and picking a name, or tap the "Link to …?" chip that appears when you type an existing page's name.
 - **Link existing words:** while editing, select a word or phrase and tap "🔗 Link …" above the keyboard to link it to a page or create a new one.
+- **Fix a link:** while editing, tap a link to change its words (capitals, punctuation), unlink it, or point it at a different page.
 - **Tap an "also known as" name** to make it the main title. Links keep working.
 - **Archive** a page from its ⋯ menu. Links to it turn faded; tap one to restore it or start a new page.
 - **Settings (⚙)**: edit page types, open the archive, and save a backup file, and import pages from a Lore Codex file (add to your codex, or replace everything). Make backups now and then.

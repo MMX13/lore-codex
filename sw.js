@@ -1,5 +1,5 @@
 // Offline support: serve the app from cache, refresh it in the background.
-const CACHE = 'lore-codex-v3';
+const CACHE = 'lore-codex-v4';
 const FONT_CACHE = 'lore-codex-fonts';
 const SHELL = [
   './',

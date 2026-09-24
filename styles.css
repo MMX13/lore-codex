@@ -745,3 +745,25 @@ body.editing .tabbar { display: none; }
   .grid { grid-template-columns: repeat(3, 1fr); }
 }
 .panel .sub { font-size: 14.5px; color: var(--ink-faint); font-style: italic; }
+.sheet-input {
+  width: 100%;
+  margin: 4px 0 12px;
+  border: 1px solid rgba(179, 139, 59, .7);
+  border-radius: 4px;
+  background: rgba(255, 250, 235, .7);
+  padding: 9px 12px;
+  font-size: 18px;
+  outline: none;
+}
+.sheet-input:focus { border-color: var(--gold-dark); }
+.suggest-search {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 8px;
+  border: 1px solid rgba(179, 139, 59, .7);
+  border-radius: 4px;
+  background: rgba(255, 250, 235, .8);
+  padding: 7px 10px;
+  font-size: 17px;
+  outline: none;
+}

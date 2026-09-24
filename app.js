@@ -164,22 +164,37 @@ function toast(msg) {
 }
 
 /* A bottom sheet with a list of actions. */
-function sheet({ title, message, actions }) {
-  const close = () => backdrop.remove();
-  const backdrop = h('div', { class: 'sheet-backdrop', onclick: e => { if (e.target === backdrop) close(); } },
+function sheet({ title, message, content, actions, onCancel }) {
+  const vv = window.visualViewport;
+  // Keep the sheet above the on-screen keyboard.
+  const fit = () => {
+    if (!vv) return;
+    backdrop.style.top = vv.offsetTop + 'px';
+    backdrop.style.height = vv.height + 'px';
+  };
+  const close = () => {
+    backdrop.remove();
+    if (vv) { vv.removeEventListener('resize', fit); vv.removeEventListener('scroll', fit); }
+  };
+  const cancel = () => { close(); if (onCancel) onCancel(); };
+  const backdrop = h('div', { class: 'sheet-backdrop', onclick: e => { if (e.target === backdrop) cancel(); } },
     h('div', { class: 'sheet leaf', role: 'dialog', 'aria-modal': 'true' },
       title && h('h3', { text: title }),
       message && h('p', { text: message }),
+      content || null,
       h('div', { class: 'sheet-actions' },
         actions.map(a => h('button', {
           class: 'btn ' + (a.style || ''),
           onclick: () => { close(); a.run(); }
         }, a.label)),
-        h('button', { class: 'btn cancel', onclick: close }, 'Cancel')
+        h('button', { class: 'btn cancel', onclick: cancel }, 'Cancel')
       )
     )
   );
+  if (vv) { vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit); }
   document.body.append(backdrop);
+  fit();
+  return { close };
 }
 
 /* ---------------------------------------------------------------- routing */
@@ -474,11 +489,13 @@ function renderPage(id) {
     view.append(h('section', { class: 'backlinks' }, h('div', { class: 'section-label', text: 'Mentioned in' }), list));
   }
 
-  // Tapping links (read mode)
+  // Tapping links: follow them when reading, adjust them when editing
   bodyEl.addEventListener('click', e => {
-    if (suppressClick || editing) return;
+    if (suppressClick) return;
     const a = e.target.closest('.link');
-    if (a) openLink(a.dataset.id, a.textContent);
+    if (!a) return;
+    if (editing) { e.preventDefault(); editLinkSheet(a); }
+    else openLink(a.dataset.id, a.textContent);
   });
 
   if (!p.archived) {
@@ -1084,7 +1101,7 @@ if (window.visualViewport) {
 window.addEventListener('resize', positionEditbar);
 
 // Keep the text caret where it is when tapping the bar's buttons.
-editbar.addEventListener('mousedown', e => e.preventDefault());
+editbar.addEventListener('mousedown', e => { if (!e.target.closest('input')) e.preventDefault(); });
 editbar.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') rememberRange(); });
 
 document.getElementById('done-btn').addEventListener('click', () => finishEdit());
@@ -1153,6 +1170,7 @@ const MENTION_RE = /(?:^|\s)@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
 
 function updateSuggestions() {
   if (!editing) return;
+  if (selPicker && suggestEl.contains(document.activeElement)) return;
   const selected = selectionInBody();
   if (selected) {
     // Keep an open picker while the same text stays selected.
@@ -1326,6 +1344,67 @@ function showChip(match) {
   }, 'Link to ', h('b', { text: displayTitle(match.p) }), '?'));
 }
 
+/* ---------------------------------------------------------------- editing an existing link */
+
+function caretAfter(node) {
+  if (!editing) return;
+  let next = node.nextSibling;
+  if (!next || next.nodeType !== Node.TEXT_NODE) {
+    next = document.createTextNode('');
+    node.after(next);
+  }
+  editing.bodyEl.focus({ preventScroll: true });
+  setCaret(next, 0);
+}
+
+function editLinkSheet(link) {
+  const target = db.pages[link.dataset.id];
+  const state = linkState(link.dataset.id);
+  const input = h('input', { class: 'sheet-input', value: link.textContent, 'aria-label': 'Link text', enterkeyhint: 'done' });
+  input.value = link.textContent;
+  const save = () => {
+    const v = input.value.replace(/\n/g, ' ');
+    if (v.trim()) link.textContent = v;
+    else { unlink(); return; }
+    caretAfter(link);
+    bodyChanged();
+  };
+  const unlink = () => {
+    const t = document.createTextNode(input.value || link.textContent);
+    link.replaceWith(t);
+    editing.bodyEl.focus({ preventScroll: true });
+    setCaret(t, t.data.length);
+    bodyChanged();
+    return t;
+  };
+  const s = sheet({
+    title: state === 'missing' ? 'Link to a deleted page'
+      : `Linked to “${displayTitle(target)}”` + (state === 'archived' ? ' (archived)' : ''),
+    content: input,
+    onCancel: () => caretAfter(link),
+    actions: [
+      { label: 'Save', style: 'gilt', run: save },
+      {
+        label: 'Link to a different page',
+        run: () => {
+          const t = unlink();
+          const r = document.createRange();
+          r.selectNodeContents(t);
+          const sel = getSelection();
+          sel.removeAllRanges();
+          sel.addRange(r);
+          const selected = selectionInBody();
+          if (selected) openSelectionPicker(selected);
+        }
+      },
+      { label: 'Unlink', run: unlink }
+    ]
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); s.close(); save(); }
+  });
+}
+
 /* ---------------------------------------------------------------- linking selected text */
 
 let selPicker = null; // { range, text } while the page picker is open for a selection
@@ -1352,33 +1431,46 @@ function showSelectionChip(selected) {
 
 function openSelectionPicker(selected) {
   const core = selected.text.trim();
-  const matches = matchPages(core.toLowerCase());
+  const search = h('input', {
+    class: 'suggest-search', value: core, placeholder: 'Search pages…',
+    'aria-label': 'Search pages', autocomplete: 'off', enterkeyhint: 'search'
+  });
+  search.value = core;
+  const list = h('div');
+  const draw = () => {
+    const q = search.value.trim();
+    const matches = matchPages(q.toLowerCase());
+    list.textContent = '';
+    for (const { p, name } of matches) {
+      const tn = typeName(p.typeId);
+      const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
+      list.append(h('button', { onclick: () => linkSelection(selected.range, p.id) },
+        h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub })));
+    }
+    if (q && !matches.some(m => m.name.toLowerCase() === q.toLowerCase())) {
+      list.append(h('button', {
+        class: 'create',
+        onclick: () => {
+          const p = {
+            id: uid(), title: q, aka: [], typeId: null, tags: [], body: [],
+            created: Date.now(), updated: Date.now()
+          };
+          db.pages[p.id] = p;
+          persistSoon();
+          linkSelection(selected.range, p.id);
+          toast(`Created page “${q}”`);
+        }
+      }, h('div', { class: 't', text: `＋ Create page “${q}”` })));
+    }
+    positionEditbar();
+  };
+  search.addEventListener('input', draw);
   chipSlot.textContent = '';
   suggestEl.textContent = '';
-  for (const { p, name } of matches) {
-    const tn = typeName(p.typeId);
-    const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
-    suggestEl.append(h('button', { onclick: () => linkSelection(selected.range, p.id) },
-      h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub })));
-  }
-  if (!matches.some(m => m.name.toLowerCase() === core.toLowerCase())) {
-    suggestEl.append(h('button', {
-      class: 'create',
-      onclick: () => {
-        const p = {
-          id: uid(), title: core, aka: [], typeId: null, tags: [], body: [],
-          created: Date.now(), updated: Date.now()
-        };
-        db.pages[p.id] = p;
-        persistSoon();
-        linkSelection(selected.range, p.id);
-        toast(`Created page “${core}”`);
-      }
-    }, h('div', { class: 't', text: `＋ Create page “${core}”` })));
-  }
+  suggestEl.append(search, list);
   suggestEl.hidden = false;
   selPicker = selected;
-  positionEditbar();
+  draw();
 }
 
 // Replace the selected text with a link, keeping any spaces around it as plain text.
