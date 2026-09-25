@@ -5,6 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
+const APP_VERSION = '1.7';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -442,7 +443,7 @@ function renderPage(id) {
     spellcheck: 'true',
     autocapitalize: 'sentences'
   });
-  renderBody(bodyEl, p.body);
+  renderReadBody(bodyEl, p.body);
   bodyEl.classList.toggle('is-empty', !p.body.length);
 
   if (p.archived) {
@@ -750,6 +751,82 @@ function linkEl(seg) {
   return h('span', { class: cls, contenteditable: 'false', 'data-id': seg.l, text: seg.t });
 }
 
+// Reading view: lines starting with "* " become bullets, "> " become quotes.
+// Each line element records where its text starts in the raw notes, so a
+// long-press can put the caret at the same spot in the editable raw text.
+const LIST_RE = /^\*\s+/;
+const QUOTE_RE = /^>\s?/;
+
+function splitLines(segs) {
+  const lines = [[]];
+  for (const s of segs) {
+    if (typeof s === 'string') {
+      s.split('\n').forEach((part, i) => {
+        if (i) lines.push([]);
+        if (part) lines[lines.length - 1].push(part);
+      });
+    } else lines[lines.length - 1].push(s);
+  }
+  return lines;
+}
+
+function renderReadBody(el, segs) {
+  el.textContent = '';
+  let offset = 0;
+  let group = null;
+  for (const line of splitLines(segs)) {
+    const len = line.reduce((n, s) => n + (typeof s === 'string' ? s.length : s.t.length), 0);
+    const first = typeof line[0] === 'string' ? line[0] : '';
+    const m = first.match(LIST_RE) || first.match(QUOTE_RE);
+    const kind = !m ? 'p' : first[0] === '*' ? 'li' : 'quote';
+    const cut = m ? m[0].length : 0;
+    const lineEl = h(kind === 'li' ? 'li' : 'div', { class: 'line', 'data-start': offset + cut });
+    line.forEach((s, i) => {
+      if (typeof s !== 'string') lineEl.append(linkEl(s));
+      else {
+        const text = i === 0 ? s.slice(cut) : s;
+        if (text) lineEl.append(document.createTextNode(text));
+      }
+    });
+    if (!lineEl.childNodes.length) lineEl.append(h('br'));
+    if (kind === 'p') { group = null; el.append(lineEl); }
+    else {
+      const tag = kind === 'li' ? 'ul' : 'blockquote';
+      if (!group || group.tagName.toLowerCase() !== tag) { group = h(tag); el.append(group); }
+      group.append(lineEl);
+    }
+    offset += len + 1;
+  }
+}
+
+// Offset in the raw notes of a caret position inside the reading view.
+function rawOffsetFromReadRange(bodyEl, range) {
+  let n = range.startContainer;
+  while (n && n !== bodyEl && !(n.nodeType === 1 && n.dataset.start != null)) n = n.parentNode;
+  if (!n || n === bodyEl) return null;
+  const r = document.createRange();
+  r.setStart(n, 0);
+  r.setEnd(range.startContainer, range.startOffset);
+  return Number(n.dataset.start) + r.toString().length;
+}
+
+// Caret position in the raw (editable) notes for a given offset.
+function rawPosition(el, off) {
+  let acc = 0;
+  const kids = [...el.childNodes];
+  for (let i = 0; i < kids.length; i++) {
+    const c = kids[i];
+    if (c.nodeType === Node.TEXT_NODE) {
+      if (off <= acc + c.data.length) return [c, off - acc];
+      acc += c.data.length;
+    } else if (c.nodeType === 1 && c.classList.contains('link')) {
+      acc += c.textContent.length;
+      if (off < acc) return [el, i + 1];
+    }
+  }
+  return null;
+}
+
 function renderBody(el, segs) {
   el.textContent = '';
   for (const s of segs) {
@@ -876,13 +953,22 @@ function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
     }
   }
 
+  const rawOff = range ? rawOffsetFromReadRange(bodyEl, range) : null;
   const topBefore = bodyEl.getBoundingClientRect().top;
   editing = { ctl, bodyEl, page };
   article.classList.add('editing');
   document.body.classList.add('editing');
+  renderBody(bodyEl, page.body);
   bodyEl.contentEditable = 'true';
-  bodyEl.dataset.placeholder = 'Write your notes… type @ to link a page';
+  bodyEl.dataset.placeholder = 'Write your notes… @ links a page, * starts a list, > a quote';
   ensureSentinel();
+  range = null;
+  const pos = rawOff != null ? rawPosition(bodyEl, rawOff) : null;
+  if (pos) {
+    range = document.createRange();
+    range.setStart(pos[0], pos[1]);
+    range.collapse(true);
+  }
   ctl.drawHead();
   showEditbar();
   // Keep the text under the finger even though the header grew.
@@ -1084,6 +1170,32 @@ function deleteLinkBeforeCaret() {
   return true;
 }
 
+// Enter on a list or quote line starts the next line with the same marker;
+// Enter on an empty list or quote line ends the list instead.
+function newLine() {
+  const sel = getSelection();
+  if (!sel.rangeCount) return insertTextAtCaret('\n');
+  const r = sel.getRangeAt(0);
+  const before = document.createRange();
+  before.setStart(editing.bodyEl, 0);
+  before.setEnd(r.startContainer, r.startOffset);
+  const all = before.toString().replace(/\u200B/g, '');
+  const line = all.slice(all.lastIndexOf('\n') + 1);
+  const m = line.match(LIST_RE) || line.match(QUOTE_RE);
+  if (!m) return insertTextAtCaret('\n');
+  const marker = line[0] === '*' ? '* ' : '> ';
+  const node = r.startContainer;
+  if (!line.slice(m[0].length).trim() && r.collapsed && node.nodeType === Node.TEXT_NODE &&
+      node.data.slice(0, r.startOffset).endsWith(line)) {
+    const at = r.startOffset - line.length;
+    node.deleteData(at, line.length);
+    setCaret(node, at);
+    bodyChanged();
+    return;
+  }
+  insertTextAtCaret('\n' + marker);
+}
+
 let bodyTimer = null;
 function bodyChanged() {
   if (!editing) return;
@@ -1107,7 +1219,7 @@ document.addEventListener('beforeinput', e => {
   const t = e.inputType;
   if (t === 'insertParagraph' || t === 'insertLineBreak') {
     e.preventDefault();
-    insertTextAtCaret('\n');
+    newLine();
   } else if (t === 'deleteContentBackward') {
     if (deleteLinkBeforeCaret()) e.preventDefault();
   } else if (t.startsWith('format')) {
@@ -1122,7 +1234,7 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Enter' && !e.isComposing) {
     e.preventDefault();
-    insertTextAtCaret('\n');
+    newLine();
   } else if (e.key === 'Escape') {
     if (!suggestEl.hidden) closeSuggest(); else finishEdit();
   }
@@ -1673,7 +1785,8 @@ function renderSettings() {
     h('div', { class: 'section-label', text: 'Page types' }), typesPanel,
     h('div', { class: 'section-label', text: 'Archive' }), archivePanel,
     h('div', { class: 'section-label', text: 'Backup' }), backupPanel,
-    h('p', { class: 'fine', text: `${pageCount} page${pageCount === 1 ? '' : 's'} in your codex · stored on this device only` })
+    h('p', { class: 'fine', text: `${pageCount} page${pageCount === 1 ? '' : 's'} in your codex · stored on this device only` }),
+    h('p', { class: 'fine version', text: `Lore Codex · version ${APP_VERSION}` })
   );
 }
 
