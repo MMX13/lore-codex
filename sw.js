@@ -1,5 +1,5 @@
-// Offline support: serve the app from cache, refresh it in the background.
-const CACHE = 'lore-codex-v4';
+// Offline support: fetch fresh files when online, fall back to the cache offline.
+const CACHE = 'lore-codex-v5';
 const FONT_CACHE = 'lore-codex-fonts';
 const SHELL = [
   './',
@@ -43,17 +43,16 @@ self.addEventListener('fetch', event => {
 
   if (url.origin !== self.location.origin) return;
 
+  // Network first so updates show up straight away; the cache is the offline fallback.
   event.respondWith(caches.open(CACHE).then(async cache => {
     const key = req.mode === 'navigate' ? './index.html' : req;
-    const hit = await cache.match(key, { ignoreSearch: true });
-    const refresh = fetch(req).then(res => {
+    try {
+      const res = await fetch(req, { cache: 'no-cache' });
       if (res.ok) cache.put(key, res.clone());
       return res;
-    }).catch(() => null);
-    if (hit) {
-      event.waitUntil(refresh);
-      return hit;
+    } catch (e) {
+      const hit = await cache.match(key, { ignoreSearch: true });
+      return hit || new Response('Offline', { status: 503 });
     }
-    return (await refresh) || new Response('Offline', { status: 503 });
   }));
 });

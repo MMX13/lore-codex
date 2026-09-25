@@ -1004,6 +1004,22 @@ function insertTextAtCaret(text) {
   bodyChanged();
 }
 
+// Phone keyboards keep the word being typed in their own buffer and re-type it
+// on the next key if the page changed it underneath them. Blurring and
+// refocusing makes the keyboard finish that word and forget it.
+function endComposition() {
+  if (!editing) return;
+  const sel = getSelection();
+  const saved = sel.rangeCount && editing.bodyEl.contains(sel.getRangeAt(0).startContainer)
+    ? sel.getRangeAt(0).cloneRange() : lastRange;
+  editing.bodyEl.blur();
+  editing.bodyEl.focus({ preventScroll: true });
+  if (saved) {
+    sel.removeAllRanges();
+    sel.addRange(saved);
+  }
+}
+
 let bodyTimer = null;
 function bodyChanged() {
   if (!editing) return;
@@ -1106,6 +1122,7 @@ editbar.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') re
 
 document.getElementById('done-btn').addEventListener('click', () => finishEdit());
 document.getElementById('at-btn').addEventListener('click', () => {
+  endComposition();
   const r = restoreRange();
   if (!r) return;
   let prev = '';
@@ -1201,6 +1218,7 @@ function openMentionMenu(ctx, query, atIndex) {
     const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
     suggestEl.append(h('button', {
       onclick: () => {
+        endComposition();
         const fresh = textBeforeCaret();
         const mm = fresh && fresh.text.match(MENTION_RE);
         if (!mm) return;
@@ -1214,6 +1232,7 @@ function openMentionMenu(ctx, query, atIndex) {
     suggestEl.append(h('button', {
       class: 'create',
       onclick: () => {
+        endComposition();
         const fresh = textBeforeCaret();
         const mm = fresh && fresh.text.match(MENTION_RE);
         if (!mm) return;
@@ -1335,6 +1354,7 @@ function showChip(match) {
   chipSlot.append(h('button', {
     class: 'link-chip',
     onclick: () => {
+      endComposition();
       const fresh = textBeforeCaret();
       const m = fresh && findChipMatch(fresh);
       if (!m) return;
@@ -1425,7 +1445,7 @@ function showSelectionChip(selected) {
   chipSlot.textContent = '';
   chipSlot.append(h('button', {
     class: 'link-chip',
-    onclick: () => openSelectionPicker(selectionInBody() || selected)
+    onclick: () => { endComposition(); openSelectionPicker(selectionInBody() || selected); }
   }, '🔗 Link ', h('b', { text: '“' + selected.text.trim() + '”' })));
 }
 
