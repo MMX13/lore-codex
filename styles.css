@@ -792,3 +792,30 @@ body.editing .tabbar { display: none; }
   background: var(--gilt-v);
 }
 .fine.version { margin-top: 4px; }
+
+/* Editing: the notes become a plain text box */
+.body-edit {
+  display: block;
+  width: 100%;
+  min-height: 7em;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  resize: none;
+  overflow: hidden;
+  font-family: var(--text);
+  font-size: 18.5px;
+  line-height: 1.55;
+  color: var(--ink);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.body-edit::placeholder { color: var(--ink-faint); font-style: italic; }
+.caret-mirror {
+  position: absolute;
+  top: 0;
+  left: -9999px;
+  visibility: hidden;
+  min-height: 0;
+}

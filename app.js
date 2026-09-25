@@ -5,7 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
-const APP_VERSION = '1.7';
+const APP_VERSION = '1.8';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -490,13 +490,11 @@ function renderPage(id) {
     view.append(h('section', { class: 'backlinks' }, h('div', { class: 'section-label', text: 'Mentioned in' }), list));
   }
 
-  // Tapping links: follow them when reading, adjust them when editing
+  // Tapping links (reading view)
   bodyEl.addEventListener('click', e => {
     if (suppressClick) return;
     const a = e.target.closest('.link');
-    if (!a) return;
-    if (editing) { e.preventDefault(); editLinkSheet(a); }
-    else openLink(a.dataset.id, a.textContent);
+    if (a) openLink(a.dataset.id, a.textContent);
   });
 
   if (!p.archived) {
@@ -810,62 +808,6 @@ function rawOffsetFromReadRange(bodyEl, range) {
   return Number(n.dataset.start) + r.toString().length;
 }
 
-// Caret position in the raw (editable) notes for a given offset.
-function rawPosition(el, off) {
-  let acc = 0;
-  const kids = [...el.childNodes];
-  for (let i = 0; i < kids.length; i++) {
-    const c = kids[i];
-    if (c.nodeType === Node.TEXT_NODE) {
-      if (off <= acc + c.data.length) return [c, off - acc];
-      acc += c.data.length;
-    } else if (c.nodeType === 1 && c.classList.contains('link')) {
-      acc += c.textContent.length;
-      if (off < acc) return [el, i + 1];
-    }
-  }
-  return null;
-}
-
-function renderBody(el, segs) {
-  el.textContent = '';
-  for (const s of segs) {
-    if (typeof s === 'string') el.append(document.createTextNode(s));
-    else el.append(linkEl(s));
-  }
-}
-
-function serializeBody(el) {
-  const segs = [];
-  let buf = '';
-  const flush = () => { if (buf) { segs.push(buf); buf = ''; } };
-  const walk = node => {
-    for (const c of node.childNodes) {
-      if (c.nodeType === Node.TEXT_NODE) buf += c.data.replace(/\u200B/g, '');
-      else if (c.nodeType === Node.ELEMENT_NODE) {
-        if (c.classList.contains('link')) {
-          flush();
-          if (c.textContent) segs.push({ l: c.dataset.id, t: c.textContent });
-        } else if (c.tagName === 'BR') {
-          if (!c.classList.contains('sentinel')) buf += '\n';
-        } else if (c.tagName === 'DIV' || c.tagName === 'P') {
-          if ((buf || segs.length) && !buf.endsWith('\n')) buf += '\n';
-          walk(c);
-        } else walk(c);
-      }
-    }
-  };
-  walk(el);
-  flush();
-  // Trim trailing whitespace from the last text segment
-  const last = segs[segs.length - 1];
-  if (typeof last === 'string') {
-    const trimmed = last.replace(/\s+$/, '');
-    if (trimmed) segs[segs.length - 1] = trimmed; else segs.pop();
-  }
-  return segs;
-}
-
 /* ---------------------------------------------------------------- long press */
 
 let suppressClick = false;
@@ -933,55 +875,140 @@ function caretRangeAt(x, y) {
 
 /* ---------------------------------------------------------------- editing */
 
-let editing = null; // { ctl, bodyEl, page }
-let lastRange = null;
+// While editing, the notes are a plain <textarea>. Links are written as @text@
+// — ordinary characters — so phone keyboards always know what's in the box.
+// The page each link points to is remembered from when editing began; new or
+// changed links are matched by page name.
+
+const LINK_RE = /(?<![\p{L}\p{N}])@([^@\s](?:[^@\n]{0,78}[^@\s])?)@(?![\p{L}\p{N}])/gu;
+const MENTION_RE = /(?:^|\s)@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
+const EDIT_PLACEHOLDER = 'Write your notes… @ links a page, * starts a list, > a quote';
+
+let editing = null; // { ctl, page, ta, links: [{ t, l }] }
+
+const cleanLinkText = t => t.replace(/@/g, '').trim();
+const normName = s => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+
+function toEditText(segs) {
+  return segs.map(s => typeof s === 'string' ? s : '@' + cleanLinkText(s.t) + '@').join('');
+}
+
+// Position in the edit text for a position in the plain notes text.
+function editOffset(segs, off) {
+  let plain = 0, edit = 0;
+  for (const s of segs) {
+    if (typeof s === 'string') {
+      if (off <= plain + s.length) return edit + off - plain;
+      plain += s.length;
+      edit += s.length;
+    } else {
+      const t = cleanLinkText(s.t);
+      if (off < plain + t.length) return edit + 1 + off - plain;
+      if (off === plain + t.length) return edit + t.length + 2;
+      plain += t.length;
+      edit += t.length + 2;
+    }
+  }
+  return edit;
+}
+
+function createStub(title) {
+  const p = {
+    id: uid(), title, aka: [], typeId: null, tags: [], body: [],
+    created: Date.now(), updated: Date.now()
+  };
+  db.pages[p.id] = p;
+  persistSoon();
+  return p;
+}
+
+function linkMatches(text) {
+  return [...text.matchAll(LINK_RE)].map(m => ({ start: m.index, end: m.index + m[0].length, t: m[1] }));
+}
+
+// Turn edit text back into notes segments.
+function fromEditText(text, known, { create = false } = {}) {
+  const used = new Set();
+  const segs = [];
+  const pushText = t => {
+    if (!t) return;
+    if (typeof segs[segs.length - 1] === 'string') segs[segs.length - 1] += t;
+    else segs.push(t);
+  };
+  const resolve = (t, k) => {
+    const take = i => { used.add(i); return known[i].l; };
+    let i = known.findIndex((x, j) => !used.has(j) && x.t === t);
+    if (i >= 0) return take(i);
+    i = known.findIndex((x, j) => !used.has(j) && normName(x.t) === normName(t));
+    if (i >= 0) return take(i);
+    const byName = activePages().find(p => namesOf(p).some(n => normName(n) === normName(t)));
+    if (byName) return byName.id;
+    if (k < known.length && !used.has(k) && normName(known[k].t).slice(0, 3) === normName(t).slice(0, 3)) return take(k);
+    return create ? createStub(t).id : null;
+  };
+  let last = 0;
+  linkMatches(text).forEach((m, k) => {
+    pushText(text.slice(last, m.start));
+    const id = resolve(m.t, k);
+    if (id) segs.push({ l: id, t: m.t });
+    else pushText(text.slice(m.start, m.end));
+    last = m.end;
+  });
+  pushText(text.slice(last));
+  return segs;
+}
 
 function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
   if (editing || ctl.page.archived) return;
   const { bodyEl, article, page } = ctl;
 
   // Work out where the caret should go before anything changes.
-  let range = null;
+  let caret = null;
   if (focus === 'body' && x != null) {
-    const r = caretRangeAt(x, y);
-    if (r && bodyEl.contains(r.startContainer)) range = r;
+    let range = null;
     const linkHit = target && target.closest && target.closest('.link');
     if (linkHit && bodyEl.contains(linkHit)) {
       range = document.createRange();
       range.setStartAfter(linkHit);
       range.collapse(true);
+    } else {
+      const r = caretRangeAt(x, y);
+      if (r && bodyEl.contains(r.startContainer)) range = r;
     }
+    const off = range ? rawOffsetFromReadRange(bodyEl, range) : null;
+    if (off != null) caret = editOffset(page.body, off);
   }
 
-  const rawOff = range ? rawOffsetFromReadRange(bodyEl, range) : null;
+  const ta = h('textarea', {
+    class: 'body body-edit',
+    placeholder: EDIT_PLACEHOLDER,
+    spellcheck: 'true',
+    autocapitalize: 'sentences',
+    rows: '4',
+    'aria-label': 'Notes'
+  });
+  ta.value = toEditText(page.body);
+  wireTextarea(ta);
+
   const topBefore = bodyEl.getBoundingClientRect().top;
-  editing = { ctl, bodyEl, page };
+  editing = {
+    ctl, page, ta,
+    links: page.body.filter(s => typeof s !== 'string').map(s => ({ t: cleanLinkText(s.t), l: s.l }))
+  };
   article.classList.add('editing');
   document.body.classList.add('editing');
-  renderBody(bodyEl, page.body);
-  bodyEl.contentEditable = 'true';
-  bodyEl.dataset.placeholder = 'Write your notes… @ links a page, * starts a list, > a quote';
-  ensureSentinel();
-  range = null;
-  const pos = rawOff != null ? rawPosition(bodyEl, rawOff) : null;
-  if (pos) {
-    range = document.createRange();
-    range.setStart(pos[0], pos[1]);
-    range.collapse(true);
-  }
+  bodyEl.replaceWith(ta);
+  autoGrow();
   ctl.drawHead();
   showEditbar();
+  startSelectionWatch();
   // Keep the text under the finger even though the header grew.
-  if (focus === 'body' && x != null) window.scrollBy(0, bodyEl.getBoundingClientRect().top - topBefore);
+  if (focus === 'body' && x != null) window.scrollBy(0, ta.getBoundingClientRect().top - topBefore);
 
   if (focus === 'body') {
-    bodyEl.focus({ preventScroll: true });
-    const sel = getSelection();
-    sel.removeAllRanges();
-    if (range) sel.addRange(range);
-    else sel.addRange(endRange());
-    anchorLinks();
-    rememberRange();
+    ta.focus({ preventScroll: true });
+    const at = caret != null ? caret : ta.value.length;
+    ta.setSelectionRange(at, at);
     scrollCaretIntoView();
   } else {
     const input = article.querySelector(`[data-f="${focus}"] input, [data-f="${focus}"] select`);
@@ -994,16 +1021,19 @@ function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
 
 function finishEdit({ rerender = true } = {}) {
   if (!editing) return;
-  const { ctl, bodyEl, page } = editing;
+  const { ctl, page, ta, links } = editing;
   // Commit any half-typed tag or name
   ctl.article.querySelectorAll('.chip-input').forEach(c => c.commit && c.commit());
-  page.body = serializeBody(bodyEl);
+  clearTimeout(saveTimer);
+  page.body = fromEditText(ta.value.replace(/\s+$/, ''), links, { create: true });
   page.title = page.title.trim();
   editing = null;
+  stopSelectionWatch();
   closeSuggest();
   hideEditbar();
   document.body.classList.remove('editing');
   if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  ta.replaceWith(ctl.bodyEl);
 
   const empty = !page.title && !page.body.length && !page.tags.length && !page.aka.length;
   if (page.fresh && empty && !backlinks(page.id).length) {
@@ -1018,262 +1048,139 @@ function finishEdit({ rerender = true } = {}) {
   if (rerender) render();
 }
 
-function endRange() {
-  const r = document.createRange();
-  const { bodyEl } = editing;
-  const sentinel = bodyEl.querySelector(':scope > br.sentinel');
-  if (sentinel) r.setStartBefore(sentinel);
-  else { r.selectNodeContents(bodyEl); r.collapse(false); }
-  r.collapse(true);
-  return r;
-}
-
 function focusBodyEnd() {
   if (!editing) return;
-  editing.bodyEl.focus({ preventScroll: true });
-  const sel = getSelection();
-  sel.removeAllRanges();
-  sel.addRange(endRange());
-  rememberRange();
+  const ta = editing.ta;
+  ta.focus({ preventScroll: true });
+  ta.setSelectionRange(ta.value.length, ta.value.length);
   scrollCaretIntoView();
 }
 
-// A trailing <br> keeps an empty last line visible so the caret can sit on it.
-function ensureSentinel() {
-  const el = editing.bodyEl;
-  const last = el.lastChild;
-  if (last && last.nodeType === 1 && last.classList.contains('sentinel')) return;
-  el.querySelectorAll('br.sentinel').forEach(b => b.remove());
-  el.append(h('br', { class: 'sentinel' }));
-}
-
-function rememberRange() {
+function autoGrow() {
   if (!editing) return;
-  const sel = getSelection();
-  if (sel.rangeCount && editing.bodyEl.contains(sel.getRangeAt(0).startContainer)) {
-    lastRange = sel.getRangeAt(0).cloneRange();
-  }
+  const ta = editing.ta;
+  const y = window.scrollY;
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + 'px';
+  if (window.scrollY !== y) window.scrollTo(0, y);
 }
 
-function restoreRange() {
-  if (!editing) return null;
-  const sel = getSelection();
-  if (sel.rangeCount && editing.bodyEl.contains(sel.getRangeAt(0).startContainer)) return sel.getRangeAt(0);
-  editing.bodyEl.focus({ preventScroll: true });
-  sel.removeAllRanges();
-  sel.addRange(lastRange && editing.bodyEl.contains(lastRange.startContainer) ? lastRange : endRange());
-  return sel.getRangeAt(0);
+let saveTimer = null;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    if (!editing) return;
+    editing.page.body = fromEditText(editing.ta.value, editing.links);
+    touch(editing.page);
+  }, 400);
 }
 
-function setCaret(node, offset) {
-  const r = document.createRange();
-  r.setStart(node, offset);
-  r.collapse(true);
-  const sel = getSelection();
-  sel.removeAllRanges();
-  sel.addRange(r);
-  lastRange = r.cloneRange();
+// Replace part of the text the way typing would, so the keyboard stays in step.
+function replaceText(start, end, text, caretAt) {
+  const ta = editing.ta;
+  ta.focus({ preventScroll: true });
+  ta.setSelectionRange(start, end);
+  let ok = false;
+  try {
+    ok = text ? document.execCommand('insertText', false, text) : document.execCommand('delete');
+  } catch (e) { ok = false; }
+  if (!ok || ta.value.slice(start, start + text.length) !== text) {
+    if (ta.value.slice(start, start + text.length) !== text) ta.setRangeText(text, start, end, 'end');
+    textChanged();
+  }
+  if (caretAt != null) ta.setSelectionRange(caretAt, caretAt);
+  updateSuggestions();
 }
 
-function insertTextAtCaret(text) {
-  const r = restoreRange();
-  if (!r) return;
-  r.deleteContents();
-  const node = r.startContainer;
-  if (node.nodeType === Node.TEXT_NODE) {
-    node.insertData(r.startOffset, text);
-    setCaret(node, r.startOffset + text.length);
-  } else {
-    const t = document.createTextNode(text);
-    r.insertNode(t);
-    setCaret(t, text.length);
-  }
-  bodyChanged();
-}
-
-// Phone keyboards keep the word being typed in their own buffer and re-type it
-// on the next key if the page changed it underneath them. Blurring and
-// refocusing makes the keyboard finish that word and forget it.
-function endComposition() {
-  if (!editing) return;
-  const sel = getSelection();
-  const saved = sel.rangeCount && editing.bodyEl.contains(sel.getRangeAt(0).startContainer)
-    ? sel.getRangeAt(0).cloneRange() : lastRange;
-  editing.bodyEl.blur();
-  editing.bodyEl.focus({ preventScroll: true });
-  if (saved) {
-    sel.removeAllRanges();
-    sel.addRange(saved);
-  }
-}
-
-// Links can't hold the caret. Keep a zero-width space on each side of every
-// link so the caret always has a text node to sit in; otherwise phones drop
-// focus (and the keyboard) when the text next to a link is deleted.
-const ZW = '\u200B';
-function anchorLinks() {
-  if (!editing) return;
-  const el = editing.bodyEl;
-  const sel = getSelection();
-  const r = sel.rangeCount ? sel.getRangeAt(0) : null;
-  const caretNode = r && r.collapsed ? r.startContainer : null;
-  const caretOffset = r ? r.startOffset : 0;
-  let moveTo = null;
-  for (const link of el.querySelectorAll('.link')) {
-    for (const after of [false, true]) {
-      const sib = after ? link.nextSibling : link.previousSibling;
-      if (sib && sib.nodeType === Node.TEXT_NODE && sib.data.length) continue;
-      let t = sib;
-      if (t && t.nodeType === Node.TEXT_NODE) {
-        t.data = ZW;
-        if (caretNode === t) moveTo = t;
-      } else {
-        t = document.createTextNode(ZW);
-        if (after) link.after(t); else link.before(t);
-        if (caretNode === el && el.childNodes[caretOffset + (after ? 0 : 1)] === t) moveTo = t;
-      }
-    }
-  }
-  if (moveTo) setCaret(moveTo, 1);
-}
-
-// Backspace right after a link removes the whole link.
-function deleteLinkBeforeCaret() {
-  if (!editing) return false;
-  const sel = getSelection();
-  if (!sel.rangeCount || !sel.isCollapsed) return false;
-  const { startContainer: n, startOffset: o } = sel.getRangeAt(0);
-  let link, node = null;
-  if (n.nodeType === Node.TEXT_NODE) {
-    if (n.data.slice(0, o).replace(/\u200B/g, '')) return false;
-    link = n.previousSibling;
-    node = n;
-  } else {
-    link = n.childNodes[o - 1];
-  }
-  if (!link || link.nodeType !== 1 || !link.classList.contains('link')) return false;
-  endComposition();
-  const before = link.previousSibling;
-  link.remove();
-  const rest = node ? node.data.slice(o).replace(/^\u200B+/, '') : '';
-  if (node) node.remove();
-  if (before && before.nodeType === Node.TEXT_NODE) {
-    const keep = before.data.replace(/\u200B+$/, '');
-    before.data = keep + rest;
-    setCaret(before, keep.length);
-  } else {
-    const t = document.createTextNode(rest || ZW);
-    if (before) before.after(t); else editing.bodyEl.prepend(t);
-    setCaret(t, rest ? 0 : 1);
-  }
-  bodyChanged();
-  return true;
+function textChanged() {
+  autoGrow();
+  scheduleSave();
+  updateSuggestions();
+  scrollCaretIntoView();
 }
 
 // Enter on a list or quote line starts the next line with the same marker;
 // Enter on an empty list or quote line ends the list instead.
 function newLine() {
-  const sel = getSelection();
-  if (!sel.rangeCount) return insertTextAtCaret('\n');
-  const r = sel.getRangeAt(0);
-  const before = document.createRange();
-  before.setStart(editing.bodyEl, 0);
-  before.setEnd(r.startContainer, r.startOffset);
-  const all = before.toString().replace(/\u200B/g, '');
-  const line = all.slice(all.lastIndexOf('\n') + 1);
+  const ta = editing.ta;
+  const pos = ta.selectionStart, end = ta.selectionEnd;
+  const lineStart = ta.value.lastIndexOf('\n', pos - 1) + 1;
+  const line = ta.value.slice(lineStart, pos);
   const m = line.match(LIST_RE) || line.match(QUOTE_RE);
-  if (!m) return insertTextAtCaret('\n');
-  const marker = line[0] === '*' ? '* ' : '> ';
-  const node = r.startContainer;
-  if (!line.slice(m[0].length).trim() && r.collapsed && node.nodeType === Node.TEXT_NODE &&
-      node.data.slice(0, r.startOffset).endsWith(line)) {
-    const at = r.startOffset - line.length;
-    node.deleteData(at, line.length);
-    setCaret(node, at);
-    bodyChanged();
-    return;
-  }
-  insertTextAtCaret('\n' + marker);
+  if (!m) return replaceText(pos, end, '\n');
+  if (!line.slice(m[0].length).trim() && pos === end) return replaceText(lineStart, pos, '');
+  replaceText(pos, end, '\n' + (line[0] === '*' ? '* ' : '> '));
 }
 
-let bodyTimer = null;
-function bodyChanged() {
-  if (!editing) return;
-  ensureSentinel();
-  anchorLinks();
-  const { bodyEl, page } = editing;
-  clearTimeout(bodyTimer);
-  bodyTimer = setTimeout(() => {
-    if (!editing) return;
-    page.body = serializeBody(bodyEl);
-    bodyEl.classList.toggle('is-empty', !page.body.length);
-    touch(page);
-  }, 250);
-  bodyEl.classList.toggle('is-empty', !bodyEl.textContent);
-  updateSuggestions();
-  scrollCaretIntoView();
+function wireTextarea(ta) {
+  ta.addEventListener('input', textChanged);
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && !e.shiftKey) {
+      e.preventDefault();
+      newLine();
+    } else if (e.key === 'Escape') {
+      if (!suggestEl.hidden) closeSuggest(); else finishEdit();
+    }
+  });
+  ta.addEventListener('beforeinput', e => {
+    if ((e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') && e.cancelable) {
+      e.preventDefault();
+      newLine();
+    }
+  });
+  for (const ev of ['select', 'keyup', 'pointerup', 'focus']) ta.addEventListener(ev, () => updateSuggestions());
 }
 
-document.addEventListener('beforeinput', e => {
-  if (!editing || !editing.bodyEl.contains(e.target)) return;
-  const t = e.inputType;
-  if (t === 'insertParagraph' || t === 'insertLineBreak') {
-    e.preventDefault();
-    newLine();
-  } else if (t === 'deleteContentBackward') {
-    if (deleteLinkBeforeCaret()) e.preventDefault();
-  } else if (t.startsWith('format')) {
-    e.preventDefault();
-  }
-});
-document.addEventListener('keydown', e => {
-  if (!editing || !editing.bodyEl.contains(e.target)) return;
-  if (e.key === 'Backspace' && !e.isComposing && deleteLinkBeforeCaret()) {
-    e.preventDefault();
-    return;
-  }
-  if (e.key === 'Enter' && !e.isComposing) {
-    e.preventDefault();
-    newLine();
-  } else if (e.key === 'Escape') {
-    if (!suggestEl.hidden) closeSuggest(); else finishEdit();
-  }
-});
-document.addEventListener('paste', e => {
-  if (!editing || !editing.bodyEl.contains(e.target)) return;
-  e.preventDefault();
-  insertTextAtCaret((e.clipboardData || window.clipboardData).getData('text/plain'));
-});
-document.addEventListener('input', e => {
-  if (editing && editing.bodyEl.contains(e.target)) bodyChanged();
-});
 document.addEventListener('selectionchange', () => {
-  if (!editing) return;
-  rememberRange();
-  const sel = getSelection();
-  if (sel.rangeCount && editing.bodyEl.contains(sel.anchorNode)) updateSuggestions();
+  if (editing && document.activeElement === editing.ta) updateSuggestions();
 });
+
+// Some phones don't report selection changes inside text boxes, so also check
+// a few times a second while editing.
+let selWatch = null, selSeen = '';
+function startSelectionWatch() {
+  stopSelectionWatch();
+  selWatch = setInterval(() => {
+    if (!editing || document.activeElement !== editing.ta) return;
+    const key = editing.ta.selectionStart + ':' + editing.ta.selectionEnd;
+    if (key !== selSeen) { selSeen = key; updateSuggestions(); }
+  }, 250);
+}
+function stopSelectionWatch() {
+  clearInterval(selWatch);
+  selWatch = null;
+  selSeen = '';
+}
+
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'hidden') return;
-  if (editing) editing.page.body = serializeBody(editing.bodyEl);
+  if (editing) editing.page.body = fromEditText(editing.ta.value, editing.links);
   persistNow();
 });
 
+// Where the caret sits on screen, measured with an invisible copy of the text.
+function caretTop(ta) {
+  const mirror = h('div', { class: 'body caret-mirror', 'aria-hidden': 'true' });
+  mirror.style.width = ta.clientWidth + 'px';
+  mirror.textContent = ta.value.slice(0, ta.selectionEnd);
+  const mark = h('span', { text: '|' });
+  mirror.append(mark);
+  document.body.append(mirror);
+  const top = mark.offsetTop;
+  const height = mark.offsetHeight;
+  mirror.remove();
+  return { top: ta.getBoundingClientRect().top + top, height };
+}
+
 function scrollCaretIntoView() {
   requestAnimationFrame(() => {
-    const sel = getSelection();
-    if (!sel.rangeCount) return;
-    let rect = sel.getRangeAt(0).getBoundingClientRect();
-    if (!rect || (!rect.height && !rect.top)) {
-      const n = sel.anchorNode && (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement);
-      if (!n) return;
-      rect = n.getBoundingClientRect();
-    }
+    if (!editing || document.activeElement !== editing.ta) return;
+    const { top, height } = caretTop(editing.ta);
     const vv = window.visualViewport;
     const viewTop = vv ? vv.offsetTop : 0;
     const viewBottom = viewTop + (vv ? vv.height : innerHeight) - editbar.offsetHeight - 12;
-    if (rect.bottom > viewBottom) window.scrollBy(0, rect.bottom - viewBottom);
-    else if (rect.top < viewTop + 12) window.scrollBy(0, rect.top - viewTop - 12);
+    if (top + height > viewBottom) window.scrollBy(0, top + height - viewBottom);
+    else if (top < viewTop + 12) window.scrollBy(0, top - viewTop - 12);
   });
 }
 
@@ -1294,140 +1201,94 @@ function hideEditbar() {
   chipSlot.textContent = '';
 }
 if (window.visualViewport) {
-  visualViewport.addEventListener('resize', () => { positionEditbar(); });
+  visualViewport.addEventListener('resize', positionEditbar);
   visualViewport.addEventListener('scroll', positionEditbar);
 }
 window.addEventListener('resize', positionEditbar);
 
-// Keep the text caret where it is when tapping the bar's buttons.
+// Keep the text box focused (and the keyboard up) when tapping the bar's buttons.
 editbar.addEventListener('mousedown', e => { if (!e.target.closest('input')) e.preventDefault(); });
-editbar.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') rememberRange(); });
 
 document.getElementById('done-btn').addEventListener('click', () => finishEdit());
 document.getElementById('at-btn').addEventListener('click', () => {
-  endComposition();
-  const r = restoreRange();
-  if (!r) return;
-  let prev = '';
-  if (r.startContainer.nodeType === Node.TEXT_NODE) prev = r.startContainer.data.slice(0, r.startOffset).slice(-1);
-  insertTextAtCaret(prev && !/\s/.test(prev) ? ' @' : '@');
+  if (!editing) return;
+  const ta = editing.ta;
+  const pos = ta.selectionStart;
+  const prev = ta.value.slice(pos - 1, pos);
+  replaceText(pos, ta.selectionEnd, prev && !/\s/.test(prev) ? ' @' : '@');
 });
 
 /* ---------------------------------------------------------------- @ mentions and link chip */
 
-// The text immediately before the caret, gathered across adjacent text nodes.
-function textBeforeCaret() {
-  if (!editing) return null;
-  const sel = getSelection();
-  if (!sel.rangeCount || !sel.isCollapsed) return null;
-  const r = sel.getRangeAt(0);
-  let node = r.startContainer, offset = r.startOffset;
-  if (!editing.bodyEl.contains(node)) return null;
-  if (node.nodeType !== Node.TEXT_NODE) {
-    const prev = node.childNodes[offset - 1];
-    if (!prev || prev.nodeType !== Node.TEXT_NODE) return null;
-    node = prev; offset = prev.data.length;
-  }
-  const nodes = [];
-  for (let n = node; n && n.nodeType === Node.TEXT_NODE; n = n.previousSibling) nodes.unshift(n);
-  let text = '';
-  const starts = [];
-  for (const t of nodes) {
-    starts.push(text.length);
-    text += t === node ? t.data.slice(0, offset) : t.data;
-  }
-  const toPos = i => {
-    for (let k = nodes.length - 1; k >= 0; k--) if (i >= starts[k]) return [nodes[k], i - starts[k]];
-    return [nodes[0], 0];
-  };
-  return { text, toPos, end: [node, offset] };
-}
-
-function replaceWithLink(ctx, startIndex, endIndex, seg, { space = false, advance = 0 } = {}) {
-  const r = document.createRange();
-  r.setStart(...ctx.toPos(startIndex));
-  if (endIndex == null) r.setEnd(...ctx.end); else r.setEnd(...ctx.toPos(endIndex));
-  r.deleteContents();
-  const link = linkEl(seg);
-  r.insertNode(link);
-  const after = link.nextSibling;
-  if (space && !(after && after.nodeType === Node.TEXT_NODE && /^\s/.test(after.data))) {
-    const sp = document.createTextNode(' ');
-    link.after(sp);
-    setCaret(sp, 1);
-  } else if (after && after.nodeType === Node.TEXT_NODE) {
-    setCaret(after, Math.min(after.data.length, space ? 1 : advance));
-  } else {
-    const t = document.createTextNode('');
-    link.after(t);
-    setCaret(t, 0);
-  }
-  editing.bodyEl.focus({ preventScroll: true });
-  bodyChanged();
-}
-
-const MENTION_RE = /(?:^|[\s\u200B])@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
+const insideLink = pos => linkMatches(editing.ta.value).some(m => pos > m.start && pos < m.end);
 
 function updateSuggestions() {
   if (!editing) return;
   if (selPicker && suggestEl.contains(document.activeElement)) return;
-  const selected = selectionInBody();
-  if (selected) {
-    // Keep an open picker while the same text stays selected.
-    if (selPicker && selPicker.text === selected.text) return;
-    closeSuggest();
-    showSelectionChip(selected);
+  const ta = editing.ta;
+  if (document.activeElement !== ta) return;
+  const { selectionStart: s, selectionEnd: e } = ta;
+
+  if (s !== e) {
+    const selected = selectedText();
+    if (selected) {
+      // Keep an open picker while the same text stays selected.
+      if (selPicker && selPicker.start === selected.start && selPicker.end === selected.end) return;
+      closeSuggest();
+      showSelectionChip(selected);
+    } else {
+      closeSuggest();
+      showChip(null);
+    }
     return;
   }
-  const ctx = textBeforeCaret();
-  if (!ctx) { closeSuggest(); showChip(null); return; }
-  const m = ctx.text.match(MENTION_RE);
+  if (insideLink(s)) { closeSuggest(); showChip(null); return; }
+  const before = ta.value.slice(0, s);
+  const m = before.match(MENTION_RE);
   if (m) {
     showChip(null);
-    openMentionMenu(ctx, m[1], ctx.text.length - m[1].length - 1);
+    openMentionMenu(m[1]);
     return;
   }
   closeSuggest();
-  showChip(findChipMatch(ctx));
+  showChip(findChipMatch(before));
 }
 
-function openMentionMenu(ctx, query, atIndex) {
+function pageButton(p, name, onPick) {
+  const tn = typeName(p.typeId);
+  const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
+  return h('button', { onclick: onPick },
+    h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub }));
+}
+
+// Replace "@query" before the caret with a finished @link@.
+function finishMention(p, name) {
+  const ta = editing.ta;
+  const pos = ta.selectionStart;
+  const m = ta.value.slice(0, pos).match(MENTION_RE);
+  if (!m) return;
+  const at = pos - m[1].length - 1;
+  const spaceAfter = /^\s/.test(ta.value.slice(pos, pos + 1));
+  const text = '@' + name + '@' + (spaceAfter ? '' : ' ');
+  editing.links.push({ t: name, l: p.id });
+  replaceText(at, pos, text, at + text.length + (spaceAfter ? 1 : 0));
+}
+
+function openMentionMenu(query) {
   const q = query.trim().toLowerCase();
   const matches = matchPages(q);
-
   suggestEl.textContent = '';
   for (const { p, name } of matches) {
-    const tn = typeName(p.typeId);
-    const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
-    suggestEl.append(h('button', {
-      onclick: () => {
-        endComposition();
-        const fresh = textBeforeCaret();
-        const mm = fresh && fresh.text.match(MENTION_RE);
-        if (!mm) return;
-        replaceWithLink(fresh, fresh.text.length - mm[1].length - 1, null, { l: p.id, t: name }, { space: true });
-      }
-    }, h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub })));
+    suggestEl.append(pageButton(p, name, () => finishMention(p, name)));
   }
   const typed = query.trim();
-  const exact = matches.some(mt => mt.name.toLowerCase() === q);
-  if (typed && !exact) {
+  if (typed && !matches.some(mt => mt.name.toLowerCase() === q)) {
     suggestEl.append(h('button', {
       class: 'create',
       onclick: () => {
-        endComposition();
-        const fresh = textBeforeCaret();
-        const mm = fresh && fresh.text.match(MENTION_RE);
-        if (!mm) return;
-        const title = mm[1].trim();
-        const p = {
-          id: uid(), title, aka: [], typeId: null, tags: [], body: [],
-          created: Date.now(), updated: Date.now()
-        };
-        db.pages[p.id] = p;
-        persistSoon();
-        replaceWithLink(fresh, fresh.text.length - mm[1].length - 1, null, { l: p.id, t: title }, { space: true });
-        toast(`Created page “${title}”`);
+        const p = createStub(typed);
+        finishMention(p, typed);
+        toast(`Created page “${typed}”`);
       }
     }, h('div', { class: 't', text: `＋ Create page “${typed}”` })));
   }
@@ -1437,7 +1298,6 @@ function openMentionMenu(ctx, query, atIndex) {
   suggestEl.hidden = false;
   positionEditbar();
 }
-
 
 function matchPages(q) {
   const self = editing.page.id;
@@ -1480,9 +1340,9 @@ const PHRASE_RE = /^[\p{L}\p{N}'’-]+(?: [\p{L}\p{N}'’-]+)*$/u;
 const words = s => (s.match(WORD_RE) || []).map(w => w.toLowerCase());
 
 // Look at the last few words typed and see if they name (all or part of) an existing page.
-function findChipMatch(ctx) {
-  const line = ctx.text.slice(ctx.text.lastIndexOf('\n') + 1);
-  const lineStart = ctx.text.length - line.length;
+function findChipMatch(text) {
+  const line = text.slice(text.lastIndexOf('\n') + 1);
+  const lineStart = text.length - line.length;
   const found = [...line.matchAll(WORD_RE)];
   if (!found.length) return null;
   const lastWord = found[found.length - 1];
@@ -1504,6 +1364,9 @@ function findChipMatch(ctx) {
     const startIdx = found[found.length - k].index;
     const endIdx = lastWord.index + lastWord[0].length;
     if (!PHRASE_RE.test(line.slice(startIdx, endIdx))) continue;
+    // Don't offer to link words that are already part of a link.
+    const start = lineStart + startIdx;
+    if (line.slice(0, startIdx).match(/@/g)?.length % 2 === 1) continue;
     let best = null;
     for (const entry of index) {
       const w = entry.w;
@@ -1519,13 +1382,7 @@ function findChipMatch(ctx) {
       }
     }
     if (best) {
-      return {
-        p: best.p,
-        name: best.name,
-        text: line.slice(startIdx, endIdx),
-        start: lineStart + startIdx,
-        end: lineStart + endIdx
-      };
+      return { p: best.p, name: best.name, text: line.slice(startIdx, endIdx), start, end: lineStart + endIdx };
     }
   }
   return null;
@@ -1537,98 +1394,36 @@ function showChip(match) {
   chipSlot.append(h('button', {
     class: 'link-chip',
     onclick: () => {
-      endComposition();
-      const fresh = textBeforeCaret();
-      const m = fresh && findChipMatch(fresh);
+      const ta = editing.ta;
+      const pos = ta.selectionStart;
+      const m = findChipMatch(ta.value.slice(0, pos));
       if (!m) return;
-      replaceWithLink(fresh, m.start, m.end, { l: m.p.id, t: m.text }, { advance: fresh.text.length - m.end });
+      editing.links.push({ t: m.text, l: m.p.id });
+      // Caret goes back where it was, shifted by the two @ marks.
+      replaceText(m.start, m.end, '@' + m.text + '@', pos + 2);
       chipSlot.textContent = '';
     }
   }, 'Link to ', h('b', { text: displayTitle(match.p) }), '?'));
 }
 
-/* ---------------------------------------------------------------- editing an existing link */
-
-function caretAfter(node) {
-  if (!editing) return;
-  let next = node.nextSibling;
-  if (!next || next.nodeType !== Node.TEXT_NODE) {
-    next = document.createTextNode(ZW);
-    node.after(next);
-  } else if (!next.data) next.data = ZW;
-  editing.bodyEl.focus({ preventScroll: true });
-  setCaret(next, next.data.startsWith(ZW) ? 1 : 0);
-}
-
-function editLinkSheet(link) {
-  const target = db.pages[link.dataset.id];
-  const state = linkState(link.dataset.id);
-  const input = h('input', { class: 'sheet-input', value: link.textContent, 'aria-label': 'Link text', enterkeyhint: 'done' });
-  input.value = link.textContent;
-  const save = () => {
-    const v = input.value.replace(/\n/g, ' ');
-    if (v.trim()) link.textContent = v;
-    else { unlink(); return; }
-    caretAfter(link);
-    bodyChanged();
-  };
-  const unlink = () => {
-    const t = document.createTextNode(input.value || link.textContent);
-    link.replaceWith(t);
-    editing.bodyEl.focus({ preventScroll: true });
-    setCaret(t, t.data.length);
-    bodyChanged();
-    return t;
-  };
-  const s = sheet({
-    title: state === 'missing' ? 'Link to a deleted page'
-      : `Linked to “${displayTitle(target)}”` + (state === 'archived' ? ' (archived)' : ''),
-    content: input,
-    onCancel: () => caretAfter(link),
-    actions: [
-      { label: 'Save', style: 'gilt', run: save },
-      {
-        label: 'Link to a different page',
-        run: () => {
-          const t = unlink();
-          const r = document.createRange();
-          r.selectNodeContents(t);
-          const sel = getSelection();
-          sel.removeAllRanges();
-          sel.addRange(r);
-          const selected = selectionInBody();
-          if (selected) openSelectionPicker(selected);
-        }
-      },
-      { label: 'Unlink', run: unlink }
-    ]
-  });
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); s.close(); save(); }
-  });
-}
-
 /* ---------------------------------------------------------------- linking selected text */
 
-let selPicker = null; // { range, text } while the page picker is open for a selection
+let selPicker = null; // { start, end, text } while the page picker is open for a selection
 
-function selectionInBody() {
-  if (!editing) return null;
-  const sel = getSelection();
-  if (!sel.rangeCount || sel.isCollapsed) return null;
-  const r = sel.getRangeAt(0);
-  if (!editing.bodyEl.contains(r.commonAncestorContainer)) return null;
-  const text = r.toString();
-  if (!text.trim() || text.includes('\n') || text.length > 80) return null;
-  if (r.cloneContents().querySelector('.link')) return null;
-  return { range: r.cloneRange(), text };
+function selectedText() {
+  const ta = editing.ta;
+  const { selectionStart: start, selectionEnd: end } = ta;
+  const text = ta.value.slice(start, end);
+  if (!text.trim() || text.includes('\n') || text.includes('@') || text.length > 80) return null;
+  if (linkMatches(ta.value).some(m => start < m.end && end > m.start)) return null;
+  return { start, end, text };
 }
 
 function showSelectionChip(selected) {
   chipSlot.textContent = '';
   chipSlot.append(h('button', {
     class: 'link-chip',
-    onclick: () => { endComposition(); openSelectionPicker(selectionInBody() || selected); }
+    onclick: () => openSelectionPicker(selected)
   }, '🔗 Link ', h('b', { text: '“' + selected.text.trim() + '”' })));
 }
 
@@ -1644,23 +1439,13 @@ function openSelectionPicker(selected) {
     const q = search.value.trim();
     const matches = matchPages(q.toLowerCase());
     list.textContent = '';
-    for (const { p, name } of matches) {
-      const tn = typeName(p.typeId);
-      const sub = name !== p.title ? 'also known as — ' + displayTitle(p) : tn;
-      list.append(h('button', { onclick: () => linkSelection(selected.range, p.id) },
-        h('div', { class: 't', text: name }), sub && h('div', { class: 'sub', text: sub })));
-    }
+    for (const { p, name } of matches) list.append(pageButton(p, name, () => linkSelection(selected, p.id)));
     if (q && !matches.some(m => m.name.toLowerCase() === q.toLowerCase())) {
       list.append(h('button', {
         class: 'create',
         onclick: () => {
-          const p = {
-            id: uid(), title: q, aka: [], typeId: null, tags: [], body: [],
-            created: Date.now(), updated: Date.now()
-          };
-          db.pages[p.id] = p;
-          persistSoon();
-          linkSelection(selected.range, p.id);
+          const p = createStub(q);
+          linkSelection(selected, p.id);
           toast(`Created page “${q}”`);
         }
       }, h('div', { class: 't', text: `＋ Create page “${q}”` })));
@@ -1676,23 +1461,18 @@ function openSelectionPicker(selected) {
   draw();
 }
 
-// Replace the selected text with a link, keeping any spaces around it as plain text.
-function linkSelection(range, pageId) {
-  const text = range.toString();
-  const lead = text.match(/^\s*/)[0];
-  const trail = text.slice(lead.length).match(/\s*$/)[0];
-  const core = text.trim();
-  range.deleteContents();
-  const after = document.createTextNode(trail);
-  const frag = document.createDocumentFragment();
-  if (lead) frag.append(lead);
-  frag.append(linkEl({ l: pageId, t: core }), after);
-  range.insertNode(frag);
-  editing.bodyEl.focus({ preventScroll: true });
-  setCaret(after, trail.length);
+// Wrap the selected words in @…@, leaving any spaces around them outside.
+function linkSelection(selected, pageId) {
+  const lead = selected.text.match(/^\s*/)[0].length;
+  const trail = selected.text.match(/\s*$/)[0].length;
+  const core = selected.text.trim();
+  const start = selected.start + lead;
+  const end = selected.end - trail;
+  editing.links.push({ t: core, l: pageId });
+  selPicker = null;
   closeSuggest();
   chipSlot.textContent = '';
-  bodyChanged();
+  replaceText(start, end, '@' + core + '@', end + 2);
 }
 
 /* ---------------------------------------------------------------- settings */
