@@ -764,7 +764,7 @@ function serializeBody(el) {
   const flush = () => { if (buf) { segs.push(buf); buf = ''; } };
   const walk = node => {
     for (const c of node.childNodes) {
-      if (c.nodeType === Node.TEXT_NODE) buf += c.data;
+      if (c.nodeType === Node.TEXT_NODE) buf += c.data.replace(/\u200B/g, '');
       else if (c.nodeType === Node.ELEMENT_NODE) {
         if (c.classList.contains('link')) {
           flush();
@@ -894,6 +894,7 @@ function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
     sel.removeAllRanges();
     if (range) sel.addRange(range);
     else sel.addRange(endRange());
+    anchorLinks();
     rememberRange();
     scrollCaretIntoView();
   } else {
@@ -1020,10 +1021,74 @@ function endComposition() {
   }
 }
 
+// Links can't hold the caret. Keep a zero-width space on each side of every
+// link so the caret always has a text node to sit in; otherwise phones drop
+// focus (and the keyboard) when the text next to a link is deleted.
+const ZW = '\u200B';
+function anchorLinks() {
+  if (!editing) return;
+  const el = editing.bodyEl;
+  const sel = getSelection();
+  const r = sel.rangeCount ? sel.getRangeAt(0) : null;
+  const caretNode = r && r.collapsed ? r.startContainer : null;
+  const caretOffset = r ? r.startOffset : 0;
+  let moveTo = null;
+  for (const link of el.querySelectorAll('.link')) {
+    for (const after of [false, true]) {
+      const sib = after ? link.nextSibling : link.previousSibling;
+      if (sib && sib.nodeType === Node.TEXT_NODE && sib.data.length) continue;
+      let t = sib;
+      if (t && t.nodeType === Node.TEXT_NODE) {
+        t.data = ZW;
+        if (caretNode === t) moveTo = t;
+      } else {
+        t = document.createTextNode(ZW);
+        if (after) link.after(t); else link.before(t);
+        if (caretNode === el && el.childNodes[caretOffset + (after ? 0 : 1)] === t) moveTo = t;
+      }
+    }
+  }
+  if (moveTo) setCaret(moveTo, 1);
+}
+
+// Backspace right after a link removes the whole link.
+function deleteLinkBeforeCaret() {
+  if (!editing) return false;
+  const sel = getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const { startContainer: n, startOffset: o } = sel.getRangeAt(0);
+  let link, node = null;
+  if (n.nodeType === Node.TEXT_NODE) {
+    if (n.data.slice(0, o).replace(/\u200B/g, '')) return false;
+    link = n.previousSibling;
+    node = n;
+  } else {
+    link = n.childNodes[o - 1];
+  }
+  if (!link || link.nodeType !== 1 || !link.classList.contains('link')) return false;
+  endComposition();
+  const before = link.previousSibling;
+  link.remove();
+  const rest = node ? node.data.slice(o).replace(/^\u200B+/, '') : '';
+  if (node) node.remove();
+  if (before && before.nodeType === Node.TEXT_NODE) {
+    const keep = before.data.replace(/\u200B+$/, '');
+    before.data = keep + rest;
+    setCaret(before, keep.length);
+  } else {
+    const t = document.createTextNode(rest || ZW);
+    if (before) before.after(t); else editing.bodyEl.prepend(t);
+    setCaret(t, rest ? 0 : 1);
+  }
+  bodyChanged();
+  return true;
+}
+
 let bodyTimer = null;
 function bodyChanged() {
   if (!editing) return;
   ensureSentinel();
+  anchorLinks();
   const { bodyEl, page } = editing;
   clearTimeout(bodyTimer);
   bodyTimer = setTimeout(() => {
@@ -1043,12 +1108,18 @@ document.addEventListener('beforeinput', e => {
   if (t === 'insertParagraph' || t === 'insertLineBreak') {
     e.preventDefault();
     insertTextAtCaret('\n');
+  } else if (t === 'deleteContentBackward') {
+    if (deleteLinkBeforeCaret()) e.preventDefault();
   } else if (t.startsWith('format')) {
     e.preventDefault();
   }
 });
 document.addEventListener('keydown', e => {
   if (!editing || !editing.bodyEl.contains(e.target)) return;
+  if (e.key === 'Backspace' && !e.isComposing && deleteLinkBeforeCaret()) {
+    e.preventDefault();
+    return;
+  }
   if (e.key === 'Enter' && !e.isComposing) {
     e.preventDefault();
     insertTextAtCaret('\n');
@@ -1183,7 +1254,7 @@ function replaceWithLink(ctx, startIndex, endIndex, seg, { space = false, advanc
   bodyChanged();
 }
 
-const MENTION_RE = /(?:^|\s)@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
+const MENTION_RE = /(?:^|[\s\u200B])@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
 
 function updateSuggestions() {
   if (!editing) return;
@@ -1370,11 +1441,11 @@ function caretAfter(node) {
   if (!editing) return;
   let next = node.nextSibling;
   if (!next || next.nodeType !== Node.TEXT_NODE) {
-    next = document.createTextNode('');
+    next = document.createTextNode(ZW);
     node.after(next);
-  }
+  } else if (!next.data) next.data = ZW;
   editing.bodyEl.focus({ preventScroll: true });
-  setCaret(next, 0);
+  setCaret(next, next.data.startsWith(ZW) ? 1 : 0);
 }
 
 function editLinkSheet(link) {
