@@ -5,7 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
-const APP_VERSION = '1.8';
+const APP_VERSION = '1.9';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -223,7 +223,8 @@ function render() {
   const [section, arg] = routeParts();
   let tab = null;
   if (!section) { renderHome(); tab = 'home'; }
-  else if (section === 'page') renderPage(arg);
+  else if (section === 'page') renderPage(arg, routeParts()[2]);
+  else if (section === 'questions') renderQuestions();
   else if (section === 'type') renderType(arg);
   else if (section === 'settings') { renderSettings(); tab = 'settings'; }
   else if (section === 'archive') renderArchive();
@@ -298,6 +299,11 @@ function renderHome() {
   if (counts[NO_TYPE]) {
     tiles.push(h('button', { class: 'tile leaf muted', onclick: () => navigate('type/' + NO_TYPE) },
       h('span', { class: 'name', text: 'Untyped' }), h('span', { class: 'count', text: counts[NO_TYPE] })));
+  }
+  const openQuestions = activePages().reduce((n, p) => n + questionsOf(p).length, 0);
+  if (openQuestions) {
+    tiles.push(h('button', { class: 'tile leaf questions-tile', onclick: () => navigate('questions') },
+      h('span', { class: 'name', text: 'Questions' }), h('span', { class: 'count', text: openQuestions })));
   }
   grid.append(h('div', { class: 'grid' }, tiles));
   if (!activePages().length) {
@@ -428,7 +434,7 @@ function newPage({ title = '', typeId = null }) {
   if (view.pageCtl) view.pageCtl.startEdit({ focus: title ? 'body' : 'title' });
 }
 
-function renderPage(id) {
+function renderPage(id, focusQuestion) {
   const p = db.pages[id];
   if (!p) {
     view.append(topbar(''), h('p', { class: 'empty-note', text: 'This page no longer exists.' }));
@@ -496,6 +502,15 @@ function renderPage(id) {
     const a = e.target.closest('.link');
     if (a) openLink(a.dataset.id, a.textContent);
   });
+
+  if (focusQuestion != null) {
+    const q = bodyEl.querySelector(`.question[data-q="${Number(focusQuestion)}"]`);
+    if (q) setTimeout(() => {
+      q.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      q.classList.add('flash');
+      setTimeout(() => q.classList.remove('flash'), 2200);
+    }, 60);
+  }
 
   if (!p.archived) {
     attachLongPress(article, (x, y, target) => {
@@ -768,24 +783,88 @@ function splitLines(segs) {
   return lines;
 }
 
+// A line's kind (plain, bullet or quote) and its pieces with the marker removed.
+function lineInfo(line) {
+  const first = typeof line[0] === 'string' ? line[0] : '';
+  const m = first.match(LIST_RE) || first.match(QUOTE_RE);
+  const kind = !m ? 'p' : first[0] === '*' ? 'li' : 'quote';
+  const cut = m ? m[0].length : 0;
+  const pieces = [];
+  line.forEach((s, i) => {
+    if (typeof s !== 'string') pieces.push(s);
+    else {
+      const text = i === 0 ? s.slice(cut) : s;
+      if (text) pieces.push(text);
+    }
+  });
+  const text = pieces.map(p => typeof p === 'string' ? p : p.t).join('');
+  const rawLen = line.reduce((n, s) => n + (typeof s === 'string' ? s.length : s.t.length), 0);
+  return { kind, cut, pieces, text, rawLen };
+}
+
+// Sentences ending in "?" — the open questions.
+const QUESTION_RE = /[^.!?\n]*\?+["”’)\]]*/g;
+function questionRanges(text) {
+  const out = [];
+  for (const m of text.matchAll(QUESTION_RE)) {
+    const start = m.index + m[0].match(/^\s*/)[0].length;
+    const end = m.index + m[0].length;
+    if (/[\p{L}\p{N}]/u.test(text.slice(start, end))) out.push({ start, end });
+  }
+  return out;
+}
+
+function questionsOf(p) {
+  const out = [];
+  for (const line of splitLines(p.body)) {
+    const { text } = lineInfo(line);
+    for (const r of questionRanges(text)) out.push(text.slice(r.start, r.end));
+  }
+  return out;
+}
+
 function renderReadBody(el, segs) {
   el.textContent = '';
   let offset = 0;
   let group = null;
+  let qCount = 0;
   for (const line of splitLines(segs)) {
-    const len = line.reduce((n, s) => n + (typeof s === 'string' ? s.length : s.t.length), 0);
-    const first = typeof line[0] === 'string' ? line[0] : '';
-    const m = first.match(LIST_RE) || first.match(QUOTE_RE);
-    const kind = !m ? 'p' : first[0] === '*' ? 'li' : 'quote';
-    const cut = m ? m[0].length : 0;
+    const { kind, cut, pieces, text, rawLen } = lineInfo(line);
     const lineEl = h(kind === 'li' ? 'li' : 'div', { class: 'line', 'data-start': offset + cut });
-    line.forEach((s, i) => {
-      if (typeof s !== 'string') lineEl.append(linkEl(s));
-      else {
-        const text = i === 0 ? s.slice(cut) : s;
-        if (text) lineEl.append(document.createTextNode(text));
+
+    // Wrap question sentences in a span; links inside them stay links.
+    const ranges = questionRanges(text);
+    const rangeAt = p => ranges.find(r => p >= r.start && p < r.end);
+    let holder = null, holderRange = null;
+    const place = (node, at) => {
+      const r = rangeAt(at);
+      if (!r) { holder = holderRange = null; lineEl.append(node); return; }
+      if (r !== holderRange) {
+        holderRange = r;
+        holder = h('span', { class: 'question', 'data-q': qCount + ranges.indexOf(r) });
+        lineEl.append(holder);
       }
-    });
+      holder.append(node);
+    };
+    let pos = 0;
+    for (const piece of pieces) {
+      if (typeof piece !== 'string') {
+        place(linkEl(piece), pos);
+        pos += piece.t.length;
+        continue;
+      }
+      const cuts = new Set([0, piece.length]);
+      for (const r of ranges) {
+        for (const b of [r.start, r.end]) if (b > pos && b < pos + piece.length) cuts.add(b - pos);
+      }
+      const marks = [...cuts].sort((a, b) => a - b);
+      for (let i = 0; i < marks.length - 1; i++) {
+        place(document.createTextNode(piece.slice(marks[i], marks[i + 1])), pos + marks[i]);
+      }
+      pos += piece.length;
+    }
+    qCount += ranges.length;
+
     if (!lineEl.childNodes.length) lineEl.append(h('br'));
     if (kind === 'p') { group = null; el.append(lineEl); }
     else {
@@ -793,7 +872,7 @@ function renderReadBody(el, segs) {
       if (!group || group.tagName.toLowerCase() !== tag) { group = h(tag); el.append(group); }
       group.append(lineEl);
     }
-    offset += len + 1;
+    offset += rawLen + 1;
   }
 }
 
@@ -1642,6 +1721,28 @@ function mergeInto(incoming) {
     added++;
   }
   return added;
+}
+
+/* ---------------------------------------------------------------- questions */
+
+function renderQuestions() {
+  const pages = activePages()
+    .map(p => ({ p, qs: questionsOf(p) }))
+    .filter(x => x.qs.length)
+    .sort((a, b) => byTitle(a.p, b.p));
+  const total = pages.reduce((n, x) => n + x.qs.length, 0);
+  view.append(topbar('Open questions'));
+  view.append(h('p', { class: 'questions-intro', text: total
+    ? `${total} unanswered across ${pages.length} page${pages.length === 1 ? '' : 's'}. A question leaves this list once its sentence no longer ends in “?”.`
+    : 'No open questions. Any sentence ending in “?” will appear here.' }));
+  const list = h('div', { class: 'list' });
+  for (const { p, qs } of pages) {
+    list.append(h('section', { class: 'q-group leaf' },
+      h('button', { class: 'q-page', onclick: () => navigate('page/' + p.id) }, displayTitle(p)),
+      qs.map((q, i) => h('button', { class: 'q-item', onclick: () => navigate(`page/${p.id}/${i}`) }, q))
+    ));
+  }
+  view.append(list);
 }
 
 /* ---------------------------------------------------------------- archive */

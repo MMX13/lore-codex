@@ -14,6 +14,7 @@ A small, personal wiki for keeping track of names, places and lore while playing
 - **Link existing words:** while editing, select a word or phrase and tap "🔗 Link …" above the keyboard to link it to a page or create a new one.
 - **Editing links:** while editing, links appear as `@Name@`. Edit them like any text (fix capitals, add punctuation); delete the @ marks to unlink. You can also type `@Name@` yourself.
 - **Lists and quotes:** start a line with `* ` for a bullet point or `> ` for a quote. Press Enter to continue the list; Enter on an empty item ends it.
+- **Questions:** any sentence ending in `?` is tinted, and the **Questions** tile on the home screen lists them all — tap one to jump to it. A question leaves the list once it no longer ends in `?`.
 - **Tap an "also known as" name** to make it the main title. Links keep working.
 - **Archive** a page from its ⋯ menu. Links to it turn faded; tap one to restore it or start a new page.
 - **Settings (⚙)**: edit page types, open the archive, and save a backup file, and import pages from a Lore Codex file (add to your codex, or replace everything). Make backups now and then.
