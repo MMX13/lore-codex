@@ -5,7 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
-const APP_VERSION = '1.9';
+const APP_VERSION = '2.0';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -27,6 +27,7 @@ function freshDb() {
     version: 1,
     types: DEFAULT_TYPES.map(name => ({ id: uid(), name })),
     pages: {},
+    terms: {},
     meta: {}
   };
 }
@@ -47,7 +48,9 @@ function normalizeDb(d) {
   }
   d.version = 1;
   d.meta = d.meta || {};
+  d.terms = d.terms && typeof d.terms === 'object' ? d.terms : {};
   for (const p of Object.values(d.pages)) {
+    p.answers = p.answers && typeof p.answers === 'object' ? p.answers : {};
     p.aka = Array.isArray(p.aka) ? p.aka : [];
     p.tags = Array.isArray(p.tags) ? p.tags : [];
     p.body = Array.isArray(p.body) ? p.body : [];
@@ -165,7 +168,7 @@ function toast(msg) {
 }
 
 /* A bottom sheet with a list of actions. */
-function sheet({ title, message, content, actions, onCancel }) {
+function sheet({ title, message, content, actions, onCancel, cancelLabel = 'Cancel' }) {
   const vv = window.visualViewport;
   // Keep the sheet above the on-screen keyboard.
   const fit = () => {
@@ -188,7 +191,7 @@ function sheet({ title, message, content, actions, onCancel }) {
           class: 'btn ' + (a.style || ''),
           onclick: () => { close(); a.run(); }
         }, a.label)),
-        h('button', { class: 'btn cancel', onclick: cancel }, 'Cancel')
+        h('button', { class: 'btn cancel', onclick: cancel }, cancelLabel)
       )
     )
   );
@@ -225,6 +228,7 @@ function render() {
   if (!section) { renderHome(); tab = 'home'; }
   else if (section === 'page') renderPage(arg, routeParts()[2]);
   else if (section === 'questions') renderQuestions();
+  else if (section === 'glossary') renderGlossary();
   else if (section === 'type') renderType(arg);
   else if (section === 'settings') { renderSettings(); tab = 'settings'; }
   else if (section === 'archive') renderArchive();
@@ -300,10 +304,18 @@ function renderHome() {
     tiles.push(h('button', { class: 'tile leaf muted', onclick: () => navigate('type/' + NO_TYPE) },
       h('span', { class: 'name', text: 'Untyped' }), h('span', { class: 'count', text: counts[NO_TYPE] })));
   }
-  const openQuestions = activePages().reduce((n, p) => n + questionsOf(p).length, 0);
-  if (openQuestions) {
+  let openQuestions = 0, anyQuestions = 0;
+  for (const p of activePages()) {
+    for (const q of questionsOf(p)) { anyQuestions++; if (!answerFor(p.answers, q)) openQuestions++; }
+  }
+  if (anyQuestions) {
     tiles.push(h('button', { class: 'tile leaf questions-tile', onclick: () => navigate('questions') },
       h('span', { class: 'name', text: 'Questions' }), h('span', { class: 'count', text: openQuestions })));
+  }
+  const termCount = allTerms().length;
+  if (termCount) {
+    tiles.push(h('button', { class: 'tile leaf glossary-tile', onclick: () => navigate('glossary') },
+      h('span', { class: 'name', text: 'Glossary' }), h('span', { class: 'count', text: termCount })));
   }
   grid.append(h('div', { class: 'grid' }, tiles));
   if (!activePages().length) {
@@ -449,7 +461,7 @@ function renderPage(id, focusQuestion) {
     spellcheck: 'true',
     autocapitalize: 'sentences'
   });
-  renderReadBody(bodyEl, p.body);
+  renderReadBody(bodyEl, p.body, p.answers);
   bodyEl.classList.toggle('is-empty', !p.body.length);
 
   if (p.archived) {
@@ -496,11 +508,15 @@ function renderPage(id, focusQuestion) {
     view.append(h('section', { class: 'backlinks' }, h('div', { class: 'section-label', text: 'Mentioned in' }), list));
   }
 
-  // Tapping links (reading view)
+  // Tapping links, terms and questions (reading view)
   bodyEl.addEventListener('click', e => {
-    if (suppressClick) return;
+    if (suppressClick || editing) return;
     const a = e.target.closest('.link');
-    if (a) openLink(a.dataset.id, a.textContent);
+    if (a) return openLink(a.dataset.id, a.textContent);
+    const t = e.target.closest('.term');
+    if (t) return openTerm(t.dataset.term, t.textContent);
+    const q = e.target.closest('.question');
+    if (q && !p.archived) openQuestion(p, Number(q.dataset.q));
   });
 
   if (focusQuestion != null) {
@@ -758,6 +774,11 @@ function openLink(id, text) {
 
 /* ---------------------------------------------------------------- body rendering */
 
+function termEl(seg) {
+  const entry = db.terms[seg.g];
+  return h('span', { class: 'term' + (entry && entry.def ? '' : ' undefined'), 'data-term': seg.g, text: seg.t });
+}
+
 function linkEl(seg) {
   const state = linkState(seg.l);
   const cls = state === 'ok' ? 'link' : state === 'stub' ? 'link stub' : 'link unwritten';
@@ -814,6 +835,9 @@ function questionRanges(text) {
   return out;
 }
 
+const qKey = q => q.replace(/\s+/g, ' ').trim();
+const answerFor = (answers, q) => (answers || {})[qKey(q)];
+
 function questionsOf(p) {
   const out = [];
   for (const line of splitLines(p.body)) {
@@ -823,7 +847,9 @@ function questionsOf(p) {
   return out;
 }
 
-function renderReadBody(el, segs) {
+let currentAnswers = {};
+function renderReadBody(el, segs, answers = {}) {
+  currentAnswers = answers;
   el.textContent = '';
   let offset = 0;
   let group = null;
@@ -841,7 +867,8 @@ function renderReadBody(el, segs) {
       if (!r) { holder = holderRange = null; lineEl.append(node); return; }
       if (r !== holderRange) {
         holderRange = r;
-        holder = h('span', { class: 'question', 'data-q': qCount + ranges.indexOf(r) });
+        const qi = qCount + ranges.indexOf(r);
+        holder = h('span', { class: 'question' + (answerFor(currentAnswers, text.slice(r.start, r.end)) ? ' answered' : ''), 'data-q': qi });
         lineEl.append(holder);
       }
       holder.append(node);
@@ -849,7 +876,7 @@ function renderReadBody(el, segs) {
     let pos = 0;
     for (const piece of pieces) {
       if (typeof piece !== 'string') {
-        place(linkEl(piece), pos);
+        place(piece.g ? termEl(piece) : linkEl(piece), pos);
         pos += piece.t.length;
         continue;
       }
@@ -965,11 +992,17 @@ const EDIT_PLACEHOLDER = 'Write your notes… @ links a page, * starts a list, >
 
 let editing = null; // { ctl, page, ta, links: [{ t, l }] }
 
-const cleanLinkText = t => t.replace(/@/g, '').trim();
+const cleanLinkText = t => t.replace(/[@#]/g, '').trim();
+const TERM_RE = /(?<![\p{L}\p{N}#])##([^#\s](?:[^#\n]{0,78}[^#\s])?)##(?![\p{L}\p{N}#])/gu;
+const markerLen = s => (s.g ? 2 : 1);
 const normName = s => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
 function toEditText(segs) {
-  return segs.map(s => typeof s === 'string' ? s : '@' + cleanLinkText(s.t) + '@').join('');
+  return segs.map(s => {
+    if (typeof s === 'string') return s;
+    const m = s.g ? '##' : '@';
+    return m + cleanLinkText(s.t) + m;
+  }).join('');
 }
 
 // Position in the edit text for a position in the plain notes text.
@@ -981,11 +1014,11 @@ function editOffset(segs, off) {
       plain += s.length;
       edit += s.length;
     } else {
-      const t = cleanLinkText(s.t);
-      if (off < plain + t.length) return edit + 1 + off - plain;
-      if (off === plain + t.length) return edit + t.length + 2;
+      const t = cleanLinkText(s.t), m = markerLen(s);
+      if (off < plain + t.length) return edit + m + off - plain;
+      if (off === plain + t.length) return edit + t.length + 2 * m;
       plain += t.length;
-      edit += t.length + 2;
+      edit += t.length + 2 * m;
     }
   }
   return edit;
@@ -1003,6 +1036,18 @@ function createStub(title) {
 
 function linkMatches(text) {
   return [...text.matchAll(LINK_RE)].map(m => ({ start: m.index, end: m.index + m[0].length, t: m[1] }));
+}
+
+// Links (@…@) and terms (##…##), in order, without overlaps.
+function markupMatches(text) {
+  const all = [
+    ...linkMatches(text).map(m => ({ ...m, kind: 'link' })),
+    ...[...text.matchAll(TERM_RE)].map(m => ({ start: m.index, end: m.index + m[0].length, t: m[1], kind: 'term' }))
+  ].sort((a, b) => a.start - b.start);
+  const out = [];
+  let last = -1;
+  for (const m of all) if (m.start >= last) { out.push(m); last = m.end; }
+  return out;
 }
 
 // Turn edit text back into notes segments.
@@ -1025,14 +1070,17 @@ function fromEditText(text, known, { create = false } = {}) {
     if (k < known.length && !used.has(k) && normName(known[k].t).slice(0, 3) === normName(t).slice(0, 3)) return take(k);
     return create ? createStub(t).id : null;
   };
-  let last = 0;
-  linkMatches(text).forEach((m, k) => {
+  let last = 0, k = 0;
+  for (const m of markupMatches(text)) {
     pushText(text.slice(last, m.start));
-    const id = resolve(m.t, k);
-    if (id) segs.push({ l: id, t: m.t });
-    else pushText(text.slice(m.start, m.end));
+    if (m.kind === 'term') segs.push({ g: termKey(m.t), t: m.t });
+    else {
+      const id = resolve(m.t, k++);
+      if (id) segs.push({ l: id, t: m.t });
+      else pushText(text.slice(m.start, m.end));
+    }
     last = m.end;
-  });
+  }
   pushText(text.slice(last));
   return segs;
 }
@@ -1045,7 +1093,7 @@ function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
   let caret = null;
   if (focus === 'body' && x != null) {
     let range = null;
-    const linkHit = target && target.closest && target.closest('.link');
+    const linkHit = target && target.closest && target.closest('.link, .term');
     if (linkHit && bodyEl.contains(linkHit)) {
       range = document.createRange();
       range.setStartAfter(linkHit);
@@ -1072,7 +1120,7 @@ function startEdit(ctl, { focus = 'body', x, y, target } = {}) {
   const topBefore = bodyEl.getBoundingClientRect().top;
   editing = {
     ctl, page, ta,
-    links: page.body.filter(s => typeof s !== 'string').map(s => ({ t: cleanLinkText(s.t), l: s.l }))
+    links: page.body.filter(s => typeof s !== 'string' && s.l).map(s => ({ t: cleanLinkText(s.t), l: s.l }))
   };
   article.classList.add('editing');
   document.body.classList.add('editing');
@@ -1299,7 +1347,7 @@ document.getElementById('at-btn').addEventListener('click', () => {
 
 /* ---------------------------------------------------------------- @ mentions and link chip */
 
-const insideLink = pos => linkMatches(editing.ta.value).some(m => pos > m.start && pos < m.end);
+const insideLink = pos => markupMatches(editing.ta.value).some(m => pos > m.start && pos < m.end);
 
 function updateSuggestions() {
   if (!editing) return;
@@ -1493,8 +1541,8 @@ function selectedText() {
   const ta = editing.ta;
   const { selectionStart: start, selectionEnd: end } = ta;
   const text = ta.value.slice(start, end);
-  if (!text.trim() || text.includes('\n') || text.includes('@') || text.length > 80) return null;
-  if (linkMatches(ta.value).some(m => start < m.end && end > m.start)) return null;
+  if (!text.trim() || /[\n@#]/.test(text) || text.length > 80) return null;
+  if (markupMatches(ta.value).some(m => start < m.end && end > m.start)) return null;
   return { start, end, text };
 }
 
@@ -1532,12 +1580,28 @@ function openSelectionPicker(selected) {
     positionEditbar();
   };
   search.addEventListener('input', draw);
+  const asTerm = h('button', { class: 'create term-option', onclick: () => markSelectionAsTerm(selected) },
+    h('div', { class: 't', text: `📖 Make “${core}” a glossary term` }));
   chipSlot.textContent = '';
   suggestEl.textContent = '';
-  suggestEl.append(search, list);
+  suggestEl.append(search, asTerm, list);
   suggestEl.hidden = false;
   selPicker = selected;
   draw();
+}
+
+// Wrap the selected words in ##…## so they become a glossary term.
+function markSelectionAsTerm(selected) {
+  const lead = selected.text.match(/^\s*/)[0].length;
+  const trail = selected.text.match(/\s*$/)[0].length;
+  const core = selected.text.trim();
+  const start = selected.start + lead;
+  const end = selected.end - trail;
+  selPicker = null;
+  closeSuggest();
+  chipSlot.textContent = '';
+  replaceText(start, end, '##' + core + '##', end + 4);
+  if (!db.terms[termKey(core)]) toast('Marked as a term — tap it while reading to define it');
 }
 
 // Wrap the selected words in @…@, leaving any spaces around them outside.
@@ -1720,28 +1784,158 @@ function mergeInto(incoming) {
     db.pages[copy.id] = copy;
     added++;
   }
+  for (const [key, t] of Object.entries(incoming.terms || {})) {
+    if (!db.terms[key] || !db.terms[key].def) db.terms[key] = t;
+  }
   return added;
 }
 
 /* ---------------------------------------------------------------- questions */
 
 function renderQuestions() {
-  const pages = activePages()
-    .map(p => ({ p, qs: questionsOf(p) }))
-    .filter(x => x.qs.length)
-    .sort((a, b) => byTitle(a.p, b.p));
-  const total = pages.reduce((n, x) => n + x.qs.length, 0);
-  view.append(topbar('Open questions'));
-  view.append(h('p', { class: 'questions-intro', text: total
-    ? `${total} unanswered across ${pages.length} page${pages.length === 1 ? '' : 's'}. A question leaves this list once its sentence no longer ends in “?”.`
-    : 'No open questions. Any sentence ending in “?” will appear here.' }));
+  const open = [], answered = [];
+  for (const p of activePages().sort(byTitle)) {
+    const o = [], a = [];
+    questionsOf(p).forEach((q, i) => (answerFor(p.answers, q) ? a : o).push({ q, i }));
+    if (o.length) open.push({ p, qs: o });
+    if (a.length) answered.push({ p, qs: a });
+  }
+  const count = groups => groups.reduce((n, g) => n + g.qs.length, 0);
+  const nOpen = count(open), nAnswered = count(answered);
+
+  view.append(topbar('Questions'));
+  view.append(h('p', { class: 'questions-intro', text: nOpen + nAnswered
+    ? 'Any sentence ending in “?” appears here. Tap a question to answer it.'
+    : 'No questions yet. Any sentence ending in “?” will appear here.' }));
+
+  const section = (label, groups, withAnswers) => {
+    if (!groups.length) return;
+    view.append(h('div', { class: 'section-label', text: `${label} · ${count(groups)}` }));
+    const list = h('div', { class: 'list' });
+    for (const { p, qs } of groups) {
+      list.append(h('section', { class: 'q-group leaf' + (withAnswers ? ' answered' : '') },
+        h('button', { class: 'q-page', onclick: () => navigate('page/' + p.id) }, displayTitle(p)),
+        qs.map(({ q, i }) => h('button', { class: 'q-item', onclick: () => openQuestion(p, i, { fromList: true }) },
+          h('span', { class: 'q-text', text: q }),
+          withAnswers && h('span', { class: 'q-answer', text: answerFor(p.answers, q).a })
+        ))
+      ));
+    }
+    view.append(list);
+  };
+  section('Open', open, false);
+  section('Answered', answered, true);
+}
+
+// Re-draw the current screen without losing the scroll position.
+function refresh() {
+  const y = window.scrollY;
+  render();
+  window.scrollTo(0, y);
+}
+
+function openQuestion(p, index, { fromList = false } = {}) {
+  const q = questionsOf(p)[index];
+  if (q == null) return;
+  const key = qKey(q);
+  p.answers = p.answers || {};
+  const existing = p.answers[key];
+  const area = h('textarea', { class: 'sheet-input sheet-area', placeholder: 'Write the answer…', rows: '4', 'aria-label': 'Answer' });
+  area.value = existing ? existing.a : '';
+  const actions = [{
+    label: existing ? 'Save answer' : 'Add answer', style: 'gilt',
+    run: () => {
+      const v = area.value.trim();
+      if (v) p.answers[key] = { a: v, updated: Date.now() };
+      else delete p.answers[key];
+      persistNow();
+      refresh();
+      toast(v ? 'Answer saved' : 'Answer removed');
+    }
+  }];
+  if (existing) {
+    actions.push({
+      label: 'Mark as open again', style: 'danger',
+      run: () => { delete p.answers[key]; persistNow(); refresh(); toast('Question reopened'); }
+    });
+  }
+  if (fromList) actions.push({ label: `Go to “${displayTitle(p)}”`, run: () => navigate(`page/${p.id}/${index}`) });
+  sheet({ title: q, content: area, actions, cancelLabel: 'Close' });
+}
+
+/* ---------------------------------------------------------------- glossary */
+
+const termKey = t => normName(t);
+
+// Every term: defined ones plus any marked with ## but not yet defined.
+function allTerms() {
+  const map = {};
+  for (const [key, t] of Object.entries(db.terms)) map[key] = { key, term: t.term, def: t.def || '', pages: [] };
+  for (const p of activePages()) {
+    for (const s of p.body) {
+      if (typeof s === 'string' || !s.g) continue;
+      const e = map[s.g] || (map[s.g] = { key: s.g, term: s.t, def: '', pages: [] });
+      if (!e.pages.includes(p)) e.pages.push(p);
+    }
+  }
+  return Object.values(map).sort((a, b) => collator.compare(a.term, b.term));
+}
+
+function openTerm(key, shown) {
+  const info = allTerms().find(t => t.key === key) || { key, term: shown, def: '', pages: [] };
+  const area = h('textarea', { class: 'sheet-input sheet-area', placeholder: 'What does it mean?', rows: '4', 'aria-label': 'Definition' });
+  area.value = info.def;
+  let s;
+  const used = info.pages.length ? h('div', { class: 'term-used' },
+    h('span', { class: 'meta-label', text: 'Appears in' }),
+    info.pages.sort(byTitle).map(p => h('button', { class: 'aka', onclick: () => { s.close(); navigate('page/' + p.id); } }, displayTitle(p)))
+  ) : null;
+  const actions = [{
+    label: info.def ? 'Save definition' : 'Add definition', style: 'gilt',
+    run: () => {
+      const v = area.value.trim();
+      if (v) db.terms[key] = { term: (db.terms[key] && db.terms[key].term) || info.term || shown, def: v, updated: Date.now() };
+      else delete db.terms[key];
+      persistNow();
+      refresh();
+      toast(v ? 'Definition saved' : 'Definition removed');
+    }
+  }];
+  s = sheet({ title: info.term || shown, content: h('div', null, area, used), actions, cancelLabel: 'Close' });
+}
+
+function newTermSheet() {
+  const name = h('input', { class: 'sheet-input', placeholder: 'Term', 'aria-label': 'Term', autocapitalize: 'words' });
+  const area = h('textarea', { class: 'sheet-input sheet-area', placeholder: 'What does it mean?', rows: '4', 'aria-label': 'Definition' });
+  sheet({
+    title: 'New term',
+    content: h('div', null, name, area),
+    actions: [{
+      label: 'Save', style: 'gilt',
+      run: () => {
+        const t = name.value.trim();
+        if (!t) return;
+        db.terms[termKey(t)] = { term: t, def: area.value.trim(), updated: Date.now() };
+        persistNow();
+        refresh();
+      }
+    }]
+  });
+  setTimeout(() => name.focus(), 50);
+}
+
+function renderGlossary() {
+  const terms = allTerms();
+  view.append(topbar('Glossary', h('button', { class: 'btn', onclick: newTermSheet }, '＋ New')));
+  view.append(h('p', { class: 'questions-intro', text: 'Mark a term while editing by wrapping it in ## — like ##Great Rune##. Tap a term anywhere to see its definition.' }));
   const list = h('div', { class: 'list' });
-  for (const { p, qs } of pages) {
-    list.append(h('section', { class: 'q-group leaf' },
-      h('button', { class: 'q-page', onclick: () => navigate('page/' + p.id) }, displayTitle(p)),
-      qs.map((q, i) => h('button', { class: 'q-item', onclick: () => navigate(`page/${p.id}/${i}`) }, q))
+  for (const t of terms) {
+    list.append(h('button', { class: 'item leaf', onclick: () => openTerm(t.key, t.term) },
+      h('div', { class: 't', text: t.term }),
+      h('div', { class: t.def ? 'snip' : 'sub', text: t.def || 'No definition yet' })
     ));
   }
+  if (!terms.length) list.append(h('p', { class: 'empty-note', text: 'No terms yet.' }));
   view.append(list);
 }
 

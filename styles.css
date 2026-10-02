@@ -860,3 +860,45 @@ body.editing .tabbar { display: none; }
   cursor: pointer;
 }
 .q-item:active { background: rgba(214, 178, 88, .15); }
+
+/* Answered questions */
+.question.answered {
+  color: var(--moss);
+  background: linear-gradient(transparent 62%, rgba(86, 97, 58, .12) 62%);
+}
+.question.answered::after {
+  content: " ✓";
+  font-size: .8em;
+  color: var(--moss);
+}
+.question { cursor: pointer; }
+.q-text { display: block; }
+.q-group.answered .q-item { color: var(--moss); }
+.q-answer {
+  display: block;
+  margin-top: 2px;
+  padding-left: 10px;
+  border-left: 2px solid rgba(86, 97, 58, .45);
+  font-size: 15.5px;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.sheet-area {
+  min-height: 6.5em;
+  resize: vertical;
+  font-family: var(--text);
+  line-height: 1.5;
+}
+
+/* Glossary terms */
+.term {
+  text-decoration: underline dotted;
+  text-decoration-color: var(--moss);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 4px;
+  cursor: help;
+}
+.term.undefined { text-decoration-color: var(--ink-faint); }
+.glossary-tile .name, .glossary-tile .count { color: var(--moss); }
+.term-used { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: -4px 0 12px; }
+.suggest .term-option .t { color: var(--moss); }
