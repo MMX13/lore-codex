@@ -5,7 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -875,9 +875,74 @@ function withAutoTerms(pieces, re) {
   return out;
 }
 
-let currentAnswers = {};
+// Inline styles. /words/ are italic (slashes hidden); "words" are literal
+// quotes, italic with the marks kept. A slash only counts at a word's edge,
+// so "city/temple" and "and/or" are left alone.
+const ITALIC_RE = /(?<![\p{L}\p{N}\/])\/([^\s\/](?:[^\/\n]*[^\s\/])?)\/(?![\p{L}\p{N}\/])/gu;
+const LITERAL_RE = /"[^"\n]+"|“[^”\n]+”/g;
+const rangesOf = (re, text) => [...text.matchAll(re)].map(m => ({ start: m.index, end: m.index + m[0].length }));
+
+// Render one line's pieces (text, links, terms) with questions, quotes and
+// italics as nested spans. Characters are never removed — italic slashes are
+// only hidden — so caret positions still line up with the raw notes.
+function renderInline(target, pieces, text, { qBase = 0, answers = null, questions = true } = {}) {
+  const qs = questions ? questionRanges(text) : [];
+  const lits = rangesOf(LITERAL_RE, text);
+  const ems = rangesOf(ITALIC_RE, text);
+  const hidden = new Set();
+  for (const r of ems) { hidden.add(r.start); hidden.add(r.end - 1); }
+  const levels = [['q', qs], ['lit', lits], ['em', ems]];
+  const stack = [null, null, null];
+  const make = (kind, r) => {
+    if (kind === 'em') return h('em');
+    if (kind === 'lit') return h('span', { class: 'lit' });
+    const answered = answers && answerFor(answers, text.slice(r.start, r.end));
+    return h('span', { class: 'question' + (answered ? ' answered' : ''), 'data-q': qBase + qs.indexOf(r) });
+  };
+  const containerFor = at => {
+    let parent = target, changed = false;
+    levels.forEach(([kind, ranges], i) => {
+      const r = ranges.find(x => at >= x.start && at < x.end) || null;
+      const prev = stack[i] ? stack[i].range : null;
+      if (!changed && prev === r) { if (stack[i] && stack[i].el) parent = stack[i].el; return; }
+      changed = true;
+      if (!r) { stack[i] = null; return; }
+      const el = make(kind, r);
+      parent.append(el);
+      stack[i] = { range: r, el };
+      parent = el;
+    });
+    return parent;
+  };
+  const cuts = new Set();
+  for (const [, ranges] of levels) for (const r of ranges) { cuts.add(r.start); cuts.add(r.end); }
+  for (const x of hidden) { cuts.add(x); cuts.add(x + 1); }
+
+  let pos = 0;
+  for (const piece of pieces) {
+    if (typeof piece !== 'string') {
+      containerFor(pos).append(piece.g ? termEl(piece) : linkEl(piece));
+      pos += piece.t.length;
+      continue;
+    }
+    const marks = [0, piece.length];
+    for (const c of cuts) if (c > pos && c < pos + piece.length) marks.push(c - pos);
+    marks.sort((a, b) => a - b);
+    for (let i = 0; i < marks.length - 1; i++) {
+      if (marks[i] === marks[i + 1]) continue;
+      const at = pos + marks[i];
+      const chunk = piece.slice(marks[i], marks[i + 1]);
+      const node = hidden.has(at) && chunk.length === 1
+        ? h('span', { class: 'mk', text: chunk })
+        : document.createTextNode(chunk);
+      containerFor(at).append(node);
+    }
+    pos += piece.length;
+  }
+  return qs.length;
+}
+
 function renderReadBody(el, segs, answers = {}) {
-  currentAnswers = answers;
   const termRe = autoTermRegex();
   el.textContent = '';
   let offset = 0;
@@ -888,40 +953,7 @@ function renderReadBody(el, segs, answers = {}) {
     const { kind, cut, text, rawLen } = info;
     const pieces = withAutoTerms(info.pieces, termRe);
     const lineEl = h(kind === 'li' ? 'li' : 'div', { class: 'line', 'data-start': offset + cut });
-
-    // Wrap question sentences in a span; links inside them stay links.
-    const ranges = questionRanges(text);
-    const rangeAt = p => ranges.find(r => p >= r.start && p < r.end);
-    let holder = null, holderRange = null;
-    const place = (node, at) => {
-      const r = rangeAt(at);
-      if (!r) { holder = holderRange = null; lineEl.append(node); return; }
-      if (r !== holderRange) {
-        holderRange = r;
-        const qi = qCount + ranges.indexOf(r);
-        holder = h('span', { class: 'question' + (answerFor(currentAnswers, text.slice(r.start, r.end)) ? ' answered' : ''), 'data-q': qi });
-        lineEl.append(holder);
-      }
-      holder.append(node);
-    };
-    let pos = 0;
-    for (const piece of pieces) {
-      if (typeof piece !== 'string') {
-        place(piece.g ? termEl(piece) : linkEl(piece), pos);
-        pos += piece.t.length;
-        continue;
-      }
-      const cuts = new Set([0, piece.length]);
-      for (const r of ranges) {
-        for (const b of [r.start, r.end]) if (b > pos && b < pos + piece.length) cuts.add(b - pos);
-      }
-      const marks = [...cuts].sort((a, b) => a - b);
-      for (let i = 0; i < marks.length - 1; i++) {
-        place(document.createTextNode(piece.slice(marks[i], marks[i + 1])), pos + marks[i]);
-      }
-      pos += piece.length;
-    }
-    qCount += ranges.length;
+    qCount += renderInline(lineEl, pieces, text, { qBase: qCount, answers });
 
     if (!lineEl.childNodes.length) lineEl.append(h('br'));
     if (kind === 'p') { group = null; el.append(lineEl); }
@@ -932,6 +964,13 @@ function renderReadBody(el, segs, answers = {}) {
     }
     offset += rawLen + 1;
   }
+}
+
+// Inline-styled plain text (for lists outside the notes themselves).
+function styledText(cls, text) {
+  const el = h('span', { class: cls });
+  renderInline(el, [text], text, { questions: false });
+  return el;
 }
 
 // Offset in the raw notes of a caret position inside the reading view.
@@ -1019,7 +1058,7 @@ function caretRangeAt(x, y) {
 
 const LINK_RE = /(?<![\p{L}\p{N}])@([^@\s](?:[^@\n]{0,78}[^@\s])?)@(?![\p{L}\p{N}])/gu;
 const MENTION_RE = /(?:^|\s)@([^\n@.,;:!?()[\]{}"“”]{0,40})$/;
-const EDIT_PLACEHOLDER = 'Write your notes… @ links a page, * starts a list, > a quote';
+const EDIT_PLACEHOLDER = 'Write your notes… @page@ links, #term# terms, /italic/, "quotes", * lists, > quote lines';
 
 let editing = null; // { ctl, page, ta, links: [{ t, l }] }
 
@@ -1847,7 +1886,7 @@ function renderQuestions() {
       list.append(h('section', { class: 'q-group leaf' + (withAnswers ? ' answered' : '') },
         h('button', { class: 'q-page', onclick: () => navigate('page/' + p.id) }, displayTitle(p)),
         qs.map(({ q, i }) => h('button', { class: 'q-item', onclick: () => openQuestion(p, i, { fromList: true }) },
-          h('span', { class: 'q-text', text: q }),
+          styledText('q-text', q),
           withAnswers && h('span', { class: 'q-answer', text: answerFor(p.answers, q).a })
         ))
       ));
