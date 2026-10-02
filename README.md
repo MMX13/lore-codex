@@ -15,7 +15,7 @@ A small, personal wiki for keeping track of names, places and lore while playing
 - **Editing links:** while editing, links appear as `@Name@`. Edit them like any text (fix capitals, add punctuation); delete the @ marks to unlink. You can also type `@Name@` yourself.
 - **Lists and quotes:** start a line with `* ` for a bullet point or `> ` for a quote. Press Enter to continue the list; Enter on an empty item ends it.
 - **Questions:** any sentence ending in `?` is tinted. Tap it to write an answer — answered questions turn green with a ✓. The **Questions** tile lists open and answered questions.
-- **Glossary terms:** while editing, wrap a word in `##` (like `##Great Rune##`), or select it and tap 🔗 → *Make it a glossary term*. Tap a term while reading to see or edit its definition. The **Glossary** tile lists every term.
+- **Glossary terms:** while editing, wrap a word in `#` (like `#Great Rune#`), or select it and tap 🔗 → *Make it a glossary term*. Tap a term while reading to see or edit its definition. The **Glossary** tile lists every term. Once a term has a definition, it is linked automatically wherever it appears.
 - **Tap an "also known as" name** to make it the main title. Links keep working.
 - **Archive** a page from its ⋯ menu. Links to it turn faded; tap one to restore it or start a new page.
 - **Settings (⚙)**: edit page types, open the archive, and save a backup file, and import pages from a Lore Codex file (add to your codex, or replace everything). Make backups now and then.

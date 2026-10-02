@@ -1,5 +1,5 @@
 // Offline support: fetch fresh files when online, fall back to the cache offline.
-const CACHE = 'lore-codex-v2.0';
+const CACHE = 'lore-codex-v2.1';
 const FONT_CACHE = 'lore-codex-fonts';
 const SHELL = [
   './',

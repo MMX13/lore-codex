@@ -5,7 +5,7 @@
    Everything is stored in this browser's localStorage. Nothing is synced.
    ========================================================================= */
 
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 const STORE_KEY = 'lore-codex:v1';
 const DEFAULT_TYPES = ['Character', 'Place', 'Boss', 'Item', 'Faction', 'Concept'];
 const NO_TYPE = '_none';
@@ -847,15 +847,46 @@ function questionsOf(p) {
   return out;
 }
 
+// Defined glossary terms are linked automatically wherever their name appears.
+function autoTermRegex() {
+  const names = Object.entries(db.terms)
+    .filter(([, t]) => t.def && t.term && t.term.trim())
+    .map(([key, t]) => ({ key, name: t.term.trim() }))
+    .sort((a, b) => b.name.length - a.name.length);
+  if (!names.length) return null;
+  const esc = n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp('(?<![\\p{L}\\p{N}])(?:' + names.map(n => esc(n.name)).join('|') + ')(?![\\p{L}\\p{N}])', 'giu');
+}
+
+// Split plain-text pieces so defined terms become term pieces (same characters).
+function withAutoTerms(pieces, re) {
+  if (!re) return pieces;
+  const out = [];
+  for (const piece of pieces) {
+    if (typeof piece !== 'string') { out.push(piece); continue; }
+    let last = 0;
+    for (const m of piece.matchAll(re)) {
+      if (m.index > last) out.push(piece.slice(last, m.index));
+      out.push({ g: termKey(m[0]), t: m[0], auto: true });
+      last = m.index + m[0].length;
+    }
+    if (last < piece.length) out.push(piece.slice(last));
+  }
+  return out;
+}
+
 let currentAnswers = {};
 function renderReadBody(el, segs, answers = {}) {
   currentAnswers = answers;
+  const termRe = autoTermRegex();
   el.textContent = '';
   let offset = 0;
   let group = null;
   let qCount = 0;
   for (const line of splitLines(segs)) {
-    const { kind, cut, pieces, text, rawLen } = lineInfo(line);
+    const info = lineInfo(line);
+    const { kind, cut, text, rawLen } = info;
+    const pieces = withAutoTerms(info.pieces, termRe);
     const lineEl = h(kind === 'li' ? 'li' : 'div', { class: 'line', 'data-start': offset + cut });
 
     // Wrap question sentences in a span; links inside them stay links.
@@ -993,14 +1024,14 @@ const EDIT_PLACEHOLDER = 'Write your notes… @ links a page, * starts a list, >
 let editing = null; // { ctl, page, ta, links: [{ t, l }] }
 
 const cleanLinkText = t => t.replace(/[@#]/g, '').trim();
-const TERM_RE = /(?<![\p{L}\p{N}#])##([^#\s](?:[^#\n]{0,78}[^#\s])?)##(?![\p{L}\p{N}#])/gu;
-const markerLen = s => (s.g ? 2 : 1);
+const TERM_RE = /(?<![\p{L}\p{N}#])#([^#\s](?:[^#\n]{0,78}[^#\s])?)#(?![\p{L}\p{N}#])/gu;
+const markerLen = () => 1;
 const normName = s => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
 function toEditText(segs) {
   return segs.map(s => {
     if (typeof s === 'string') return s;
-    const m = s.g ? '##' : '@';
+    const m = s.g ? '#' : '@';
     return m + cleanLinkText(s.t) + m;
   }).join('');
 }
@@ -1038,7 +1069,7 @@ function linkMatches(text) {
   return [...text.matchAll(LINK_RE)].map(m => ({ start: m.index, end: m.index + m[0].length, t: m[1] }));
 }
 
-// Links (@…@) and terms (##…##), in order, without overlaps.
+// Links (@…@) and terms (#…#), in order, without overlaps.
 function markupMatches(text) {
   const all = [
     ...linkMatches(text).map(m => ({ ...m, kind: 'link' })),
@@ -1590,7 +1621,7 @@ function openSelectionPicker(selected) {
   draw();
 }
 
-// Wrap the selected words in ##…## so they become a glossary term.
+// Wrap the selected words in #…# so they become a glossary term.
 function markSelectionAsTerm(selected) {
   const lead = selected.text.match(/^\s*/)[0].length;
   const trail = selected.text.match(/\s*$/)[0].length;
@@ -1600,7 +1631,7 @@ function markSelectionAsTerm(selected) {
   selPicker = null;
   closeSuggest();
   chipSlot.textContent = '';
-  replaceText(start, end, '##' + core + '##', end + 4);
+  replaceText(start, end, '#' + core + '#', end + 2);
   if (!db.terms[termKey(core)]) toast('Marked as a term — tap it while reading to define it');
 }
 
@@ -1867,15 +1898,24 @@ function openQuestion(p, index, { fromList = false } = {}) {
 
 const termKey = t => normName(t);
 
-// Every term: defined ones plus any marked with ## but not yet defined.
+// Every term: defined ones plus any marked with # but not yet defined.
 function allTerms() {
   const map = {};
   for (const [key, t] of Object.entries(db.terms)) map[key] = { key, term: t.term, def: t.def || '', pages: [] };
+  const re = autoTermRegex();
   for (const p of activePages()) {
     for (const s of p.body) {
       if (typeof s === 'string' || !s.g) continue;
       const e = map[s.g] || (map[s.g] = { key: s.g, term: s.t, def: '', pages: [] });
       if (!e.pages.includes(p)) e.pages.push(p);
+    }
+    if (!re) continue;
+    for (const s of p.body) {
+      if (typeof s !== 'string') continue;
+      for (const m of s.matchAll(re)) {
+        const e = map[termKey(m[0])];
+        if (e && !e.pages.includes(p)) e.pages.push(p);
+      }
     }
   }
   return Object.values(map).sort((a, b) => collator.compare(a.term, b.term));
@@ -1927,7 +1967,7 @@ function newTermSheet() {
 function renderGlossary() {
   const terms = allTerms();
   view.append(topbar('Glossary', h('button', { class: 'btn', onclick: newTermSheet }, '＋ New')));
-  view.append(h('p', { class: 'questions-intro', text: 'Mark a term while editing by wrapping it in ## — like ##Great Rune##. Tap a term anywhere to see its definition.' }));
+  view.append(h('p', { class: 'questions-intro', text: 'Mark a term while editing by wrapping it in # — like #Great Rune#. Once a term has a definition, it is linked automatically wherever it appears. Tap a term to see its definition.' }));
   const list = h('div', { class: 'list' });
   for (const t of terms) {
     list.append(h('button', { class: 'item leaf', onclick: () => openTerm(t.key, t.term) },
